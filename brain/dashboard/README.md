@@ -17,7 +17,7 @@ Dashboard web completo para controlar el ESP32 vía **UART** desde cualquier dis
 ```bash
 cd dashboard
 pip install -r requirements.txt
-python dashboard_server.py --uart-port /dev/ttyUSB0
+python dashboard_server.py --port-name /dev/ttyCH341USB0
 # En Windows: python dashboard_server.py --uart-port COM3
 ```
 
@@ -36,7 +36,7 @@ Luego en el navegador:
 ### Opción 3: Usar el script de inicio
 ```bash
 cd dashboard
-./start_dashboard.sh --uart-port /dev/ttyUSB0
+python dashboard/dashboard_server.py --port-name /dev/ttyCH341USB0
 ```
 
 ## 🌐 Acceso
@@ -51,13 +51,13 @@ Dashboard available at:
   Local:   http://127.0.0.1:5000
   Network: http://192.168.1.100:5000
 ============================================================
-UART: Connected to /dev/ttyUSB0
+UART: Connected to /dev/ttyCH341USB0
 ============================================================
 ```
 
 - **Local**: Acceso desde la misma máquina
 - **Network**: Acceso desde cualquier dispositivo en la misma red (usar esta IP)
-- **UART**: Conexión serial al ESP32 (921600 baud)
+- **UART**: Conexión serial al ESP32 por USB (115200 baud)
 
 ## ✨ Características
 
@@ -71,9 +71,19 @@ UART: Connected to /dev/ttyUSB0
 
 ## 🔌 Configuración UART
 
-- **Baud rate**: 921600 (configurado automáticamente)
-- **Puerto**: Configurable (ej: `/dev/ttyUSB0` en Linux, `COM3` en Windows)
-- **Protocolo**: `CHANNEL:COMMAND:VALUE\n` (ver `docs/BRAIN_TEAM_PROTOCOL.md`)
+- **Firmware**: [Bosch-Aura/embedded](https://github.com/Bosch-Aura/embedded) (no se modifica desde este repo)
+- **Baud rate**: 115200 por USB (configurado automáticamente)
+- **Puerto**: en la Jetson `/dev/ttyCH341USB0` (driver WCH); en una PC suele ser `/dev/ttyUSB0`
+- **Protocolo**: `CHANNEL:COMMAND:VALUE\n` (ver `embedded/docs/BRAIN_TEAM_PROTOCOL.md`), implementado en `brain/command_sender.py`
+
+Comportamiento del enlace:
+
+- **Arranque**: abrir el puerto reinicia el ESP32. Al recibir `EVENT:SYSTEM_READY` (o a los 3 s si no llega) se manda `M:SYS_ARM:0`. Si la placa se reinicia en medio de la sesión se rearma sola, pero no se mueve hasta un `C:SET_SPEED` nuevo.
+- **Watchdog**: el heartbeat manda `M:PING:0` cada 50 ms (el ESP32 pasa a `FAULT` sin tráfico durante 300 ms). `FAULT` no se rearma solo: usar el toggle *Armed*.
+- **Velocidad**: la UI y las estrategias siguen usando 0-255. Se mapea a duty `140..255` (por debajo de 140 el motor no arranca). Marcha atrás con `C:SET_DIR:0`, enviado solo cuando cambia el sentido.
+- **Dirección**: el valor de servo (50-160) se manda tal cual. Si el auto gira al revés, poner `STEER_INVERTED = True` en `command_sender.py`.
+- **Ultrasonido**: lo maneja el ESP32 (`EVENT:OBSTACLE_DETECTED` → `STOPPED`). Al llegar `EVENT:OBSTACLE_CLEARED` el dashboard reenvía la última velocidad pedida.
+- **Modo AUTO/MANUAL**: el ESP32 no tiene modos; el toggle solo cambia el estado del lado de la Jetson.
 
 ## 📖 Documentación
 

@@ -117,6 +117,9 @@ h1 {
 .status-value.fault {
   color: #ffc107;
 }
+.status-value.stopped {
+  color: #fd7e14;
+}
 
 .main-layout {
   display: grid;

@@ -667,24 +667,6 @@
         if (message && message.trim().length > 0) {
           log(`ESP32: ${message}`, "serial");
 
-          const servoCenter = 105;
-          const servoRight = 50;
-          const angleMax = 30;
-          const speedUiMax = 255;
-          const speedMmMax = 500;
-
-          function mapSpeedMmToUi(speedMm) {
-            const magnitude = Math.min(Math.abs(speedMm), speedMmMax);
-            return Math.round((magnitude / speedMmMax) * speedUiMax);
-          }
-
-          function mapSteerTenthsToServo(steerTenths) {
-            const conversionFactor = (servoCenter - servoRight) / angleMax;
-            const steeringAngle = steerTenths / 10;
-            const servoAngle = Math.round(servoCenter - (steeringAngle * conversionFactor));
-            return Math.max(50, Math.min(160, servoAngle));
-          }
-
           // Parse system events and update status in real-time
           if (message.startsWith("EVENT:STATE_CHANGED:")) {
             const state = message.replace("EVENT:STATE_CHANGED:", "").trim();
@@ -693,41 +675,20 @@
             const mode = message.replace("EVENT:MODE_CHANGED:", "").trim();
             updateStatusDisplay(null, mode);
           } else if (message.startsWith("EVENT:CMD_EXECUTED:SET_SPEED:")) {
-            // Update speed slider and display
-            const speedStr = message
-              .replace("EVENT:CMD_EXECUTED:SET_SPEED:", "")
-              .trim();
-            const speed = parseInt(speedStr);
-            if (!isNaN(speed)) {
-              const speedSlider = document.getElementById("speed-slider");
-              const speedValue = document.getElementById("speed-value");
-              const speedDisplay = document.getElementById("speed-display");
-
-              if (speedSlider && speedValue && speedDisplay) {
-                speedSlider.value = speed;
-                speedValue.textContent = speed;
-                speedDisplay.textContent =
-                  speed === 0 ? "Stopped: 0" : `Speed: ${speed}`;
-              }
+            // ESP32 reports the applied PWM duty (0-255), not the UI speed:
+            // show it without moving the speed slider
+            const duty = parseInt(
+              message.replace("EVENT:CMD_EXECUTED:SET_SPEED:", "").trim()
+            );
+            const speedDisplay = document.getElementById("speed-display");
+            if (!isNaN(duty) && speedDisplay) {
+              speedDisplay.textContent =
+                duty === 0 ? "Stopped: 0" : `Duty: ${duty}`;
             }
-          } else if (message.startsWith("@speed:")) {
-            const speedStr = message.replace("@speed:", "").replace(";;", "").trim();
-            const speedMm = parseInt(speedStr);
-            if (!isNaN(speedMm)) {
-              const speedSlider = document.getElementById("speed-slider");
-              const speedValue = document.getElementById("speed-value");
-              const speedDisplay = document.getElementById("speed-display");
-              const uiSpeed = mapSpeedMmToUi(speedMm);
-
-              if (speedSlider && speedValue && speedDisplay) {
-                speedSlider.value = uiSpeed;
-                speedValue.textContent = uiSpeed;
-                speedDisplay.textContent =
-                  speedMm === 0
-                    ? "Stopped: 0"
-                    : `Speed: ${speedMm} mm/s`;
-              }
-            }
+          } else if (message.startsWith("EVENT:OBSTACLE_DETECTED")) {
+            log(`Obstacle ahead - ESP32 stopped the car (${message})`, "error");
+          } else if (message.startsWith("EVENT:OBSTACLE_CLEARED")) {
+            log("Obstacle cleared - resuming last speed", "success");
           } else if (message.startsWith("EVENT:CMD_EXECUTED:SET_STEER:")) {
             // Update steering slider and display
             const angleStr = message
@@ -752,29 +713,6 @@
                   steerDisplay.textContent = `Right: ${angle}°`;
                 } else {
                   // Higher value (160) = left turn
-                  steerDisplay.textContent = `Left: ${angle}°`;
-                }
-              }
-            }
-          } else if (message.startsWith("@steer:")) {
-            const steerStr = message.replace("@steer:", "").replace(";;", "").trim();
-            const steerTenths = parseInt(steerStr);
-            if (!isNaN(steerTenths)) {
-              const steerSlider = document.getElementById("steer-slider");
-              const steerValue = document.getElementById("steer-value");
-              const steerDisplay = document.getElementById("steer-display");
-              const angle = mapSteerTenthsToServo(steerTenths);
-
-              if (steerSlider && steerValue && steerDisplay) {
-                steerSlider.value = angle;
-                steerValue.textContent = `${angle}°`;
-
-                const center = 105;
-                if (angle === center) {
-                  steerDisplay.textContent = "Center: 105°";
-                } else if (angle < center) {
-                  steerDisplay.textContent = `Right: ${angle}°`;
-                } else {
                   steerDisplay.textContent = `Left: ${angle}°`;
                 }
               }
@@ -922,7 +860,8 @@
           // Update arm toggle based on state
           const armToggle = document.getElementById("arm-toggle");
           if (armToggle) {
-            armToggle.checked = state === "ARMED" || state === "RUNNING";
+            armToggle.checked =
+              state === "ARMED" || state === "RUNNING" || state === "STOPPED";
           }
         }
 
@@ -1127,7 +1066,7 @@
           }
         }
 
-        // Send command to Nucleo via backend translator
+        // Send command to ESP32 via backend translator
         if (speedMagnitude === 0) {
           sendCommand("changeSpeed?speed=0&direction=forward");
         } else {

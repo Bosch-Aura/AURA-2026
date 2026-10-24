@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Flask server for the car control dashboard (Nucleo/STM32 over UART).
-Serves the dashboard and proxies commands to the Nucleo via serial.
+Flask server for the car control dashboard (ESP32 over UART).
+Serves the dashboard and proxies commands to the ESP32 via serial.
+Protocol: Bosch-Aura/embedded docs/BRAIN_TEAM_PROTOCOL.md
 """
 
 from flask import Flask, send_from_directory, request, jsonify, Response, stream_with_context
@@ -87,17 +88,6 @@ except ImportError as e:
     SignController = None
     import_errors['SignController'] = str(e)
 
-try:
-    from safety.ultra_uart import ThreadUltraUART
-except ImportError as e:
-    print(f"Warning: Could not import ThreadUltraUART: {e}")
-    ThreadUltraUART = None
-    import_errors['ThreadUltraUART'] = str(e)
-except Exception as e:
-    print(f"Warning: Error importing ThreadUltraUART: {e}")
-    ThreadUltraUART = None
-    import_errors['ThreadUltraUART'] = str(e)
-
 # Try to import serial
 try:
     import serial
@@ -124,9 +114,10 @@ except Exception as e:
 # Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# UART Configuration
+# UART Configuration (ESP32 USB link; the board shows up as /dev/ttyCH341USB0 on the Jetson)
 UART_BAUD_RATE = 115200
-UART_TERMINATOR = ";;\r\n"
+# Opening the port reboots the ESP32: wait this long for EVENT:SYSTEM_READY before arming anyway
+ESP32_BOOT_TIMEOUT = 3.0
 
 # Global serial connection
 serial_conn = None
@@ -158,9 +149,10 @@ sign_detection_status_broadcast_thread = None
 # ...
 
 # System state tracking
-# Default state: armed, manual mode (Nucleo)
-system_state = {'mode': 'MANUAL', 'state': 'RUNNING'}
+# The ESP32 boots DISARMED and has no driving modes: 'mode' is tracked only on the Jetson side
+system_state = {'mode': 'MANUAL', 'state': 'DISARMED'}
 system_state_lock = threading.Lock()
+esp32_ready_event = threading.Event()  # Set on EVENT:SYSTEM_READY
 
 # Auto-pilot components
 video_streamer = None
@@ -172,21 +164,16 @@ sign_detector = None
 sign_detection_controller = None
 sign_detection_initializing = False  # True while loading YOLO model in background
 
-# UltraSafety components (ESP32 ultrasonic reader + safety supervisor)
-ultra_thread = None
-ultra_safety_thread = None
-ultra_safety_running = False
+# UltraSafety: the ESP32 stops by itself on an obstacle (STOPPED) and reports it with
+# EVENT:OBSTACLE_DETECTED / EVENT:OBSTACLE_CLEARED. On clear it does NOT resume the
+# latched speed, so the Jetson re-sends the last requested speed.
 ultra_safety_enabled = True
-ultra_last_ui_speed = 0
 ultra_last_status = {
     "ultra_blocking": False,
-    "saved_speed_ui": None,
-    "stale": True,
-    "valid": False,
-    "present": False,
     "dist_cm": None,
-    "last_update_age_ms": None,
+    "last_event_age_ms": None,
 }
+ultra_last_event_time = None
 ultra_status_lock = threading.Lock()
 
 app = Flask(__name__, static_folder=SCRIPT_DIR)
@@ -194,16 +181,15 @@ CORS(app)  # Enable CORS for all routes
 
 
 def write_uart_command(command: str):
-    """Write a UART command. Nucleo expects lines ending with \\r\\n (do not strip)."""
+    """Write a UART command line (CHANNEL:COMMAND:VALUE\\n) to the ESP32."""
     global serial_conn
     if not serial_conn or not serial_conn.is_open:
         return False, "Serial port not connected"
 
     try:
         with serial_lock:
-            # Keep terminator ;;\\r\\n intact - do not strip or Nucleo may not parse
             if not command.endswith("\n"):
-                command = command + "\r\n"
+                command = command + "\n"
             line = command.encode("utf-8")
             serial_conn.write(line)
             serial_conn.flush()
@@ -214,55 +200,39 @@ def write_uart_command(command: str):
 
 
 def translate_http_to_uart(endpoint: str, args: dict):
-    """Translate HTTP endpoint to UART command (Nucleo: #key:payload;;\\r\\n, keys from main.cpp)."""
-    from command_sender import KEY_STEER, KEY_SPEED, KEY_BRAKE, KEY_KL
+    """
+    Translate a dashboard HTTP endpoint to an ESP32 action.
+
+    Returns (success, message, action). action is a function that takes the
+    CommandSender and returns True if sent, or None when nothing must be sent.
+    Speed/steer go through CommandSender so direction tracking stays consistent.
+    """
     SERVO_CENTER = 105
     SERVO_RIGHT = 50   # Right turn (lower value)
     SERVO_LEFT = 160   # Left turn (higher value)
-    ANGLE_MAX = 30
     SPEED_UI_MAX = 255
-    SPEED_MM_S_MAX = 500
-    STEER_TENTHS_MIN = -250
-    STEER_TENTHS_MAX = 250
     FORWARD_SPEED = 220
 
-    def format_command(key: str, payload: str) -> str:
-        return f"#{key}:{payload}{UART_TERMINATOR}"
-
-    def convert_ui_speed_to_mm_s(speed_value: int, direction: str = "forward") -> int:
-        scaled = int(round((speed_value / SPEED_UI_MAX) * SPEED_MM_S_MAX))
-        scaled = -abs(scaled) if direction.lower() == "backward" else abs(scaled)
-        return max(-SPEED_MM_S_MAX, min(SPEED_MM_S_MAX, scaled))
-
-    def convert_servo_to_steer_tenths(angle_value: int) -> int:
-        conversion_factor = (SERVO_CENTER - SERVO_RIGHT) / ANGLE_MAX
-        steering_angle = (SERVO_CENTER - angle_value) / conversion_factor
-        steering_tenths = int(round(steering_angle * 10))
-        return max(STEER_TENTHS_MIN, min(STEER_TENTHS_MAX, steering_tenths))
-
-    # kl = Nucleo CKlmanager (arm/disarm/mode)
     if endpoint == 'arm':
-        return True, "ARM", format_command(KEY_KL, "30")
+        return True, "ARM", lambda cs: cs.send_arm()
     elif endpoint == 'disarm':
-        return True, "DISARM", format_command(KEY_KL, "0")
+        return True, "DISARM", lambda cs: cs.send_disarm()
     elif endpoint == 'mode':
+        # The ESP32 has no driving modes: AUTO/MANUAL only lives on the Jetson
         value = args.get('value', '').upper()
-        if value == 'AUTO':
-            return True, "MODE: AUTO", format_command(KEY_KL, "30")
-        elif value == 'MANUAL':
-            return True, "MODE: MANUAL", format_command(KEY_KL, "15")
-        else:
+        if value not in ('AUTO', 'MANUAL'):
             return False, "Invalid mode value", None
+        with system_state_lock:
+            system_state['mode'] = value
+        return True, f"MODE: {value}", None
     elif endpoint == 'brake':
-        return True, "BRAKE", format_command(KEY_BRAKE, "0")
+        return True, "BRAKE", lambda cs: cs.send_brake()
     elif endpoint == 'forward':
-        speed_mm_s = convert_ui_speed_to_mm_s(FORWARD_SPEED, "forward")
-        return True, "FORWARD", format_command(KEY_SPEED, str(speed_mm_s))
+        return True, "FORWARD", lambda cs: cs.send_speed_command(FORWARD_SPEED, "forward")
     elif endpoint == 'back':
-        speed_mm_s = convert_ui_speed_to_mm_s(SPEED_UI_MAX, "backward")
-        return True, "BACKWARD", format_command(KEY_SPEED, str(speed_mm_s))
+        return True, "BACKWARD", lambda cs: cs.send_speed_command(SPEED_UI_MAX, "backward")
     elif endpoint == 'driveStop':
-        return True, "STOP", format_command(KEY_SPEED, "0")
+        return True, "STOP", lambda cs: cs.send_speed_command(0)
     elif endpoint == 'changeSpeed':
         speed_str = args.get('speed', '0')
         direction_str = args.get('direction', 'forward')
@@ -271,14 +241,12 @@ def translate_http_to_uart(endpoint: str, args: dict):
             if speed < 0 or speed > SPEED_UI_MAX:
                 return False, f"Speed must be 0-{SPEED_UI_MAX}", None
             if speed == 0:
-                return True, "STOP", format_command(KEY_SPEED, "0")
-            else:
-                speed_mm_s = convert_ui_speed_to_mm_s(speed, direction_str)
-                return (
-                    True,
-                    f"SPEED: {speed} ({direction_str})",
-                    format_command(KEY_SPEED, str(speed_mm_s)),
-                )
+                return True, "STOP", lambda cs: cs.send_speed_command(0)
+            return (
+                True,
+                f"SPEED: {speed} ({direction_str})",
+                lambda cs: cs.send_speed_command(speed, direction_str),
+            )
         except ValueError:
             return False, "Invalid speed value", None
     elif endpoint == 'steer' or endpoint == 'changeSteer':
@@ -287,25 +255,21 @@ def translate_http_to_uart(endpoint: str, args: dict):
             angle = int(angle_str)
             if angle < SERVO_RIGHT or angle > SERVO_LEFT:
                 return False, f"Angle must be {SERVO_RIGHT}-{SERVO_LEFT}", None
-            steering_tenths = convert_servo_to_steer_tenths(angle)
-            return True, f"STEER: {angle}°", format_command(KEY_STEER, str(steering_tenths))
+            return True, f"STEER: {angle}°", lambda cs: cs.send_steering_command(angle)
         except ValueError:
             return False, "Invalid angle value", None
     elif endpoint == 'left':
-        steering_tenths = convert_servo_to_steer_tenths(SERVO_LEFT)
-        return True, "LEFT", format_command(KEY_STEER, str(steering_tenths))
+        return True, "LEFT", lambda cs: cs.send_steering_command(SERVO_LEFT)
     elif endpoint == 'right':
-        steering_tenths = convert_servo_to_steer_tenths(SERVO_RIGHT)
-        return True, "RIGHT", format_command(KEY_STEER, str(steering_tenths))
+        return True, "RIGHT", lambda cs: cs.send_steering_command(SERVO_RIGHT)
     elif endpoint == 'steerStop':
-        steering_tenths = convert_servo_to_steer_tenths(SERVO_CENTER)
-        return True, "CENTER", format_command(KEY_STEER, str(steering_tenths))
+        return True, "CENTER", lambda cs: cs.send_steering_command(SERVO_CENTER)
     elif endpoint == 'LightsOn':
-        return False, "Lights not supported", None
+        return True, "LIGHTS ON", lambda cs: cs.send_lights("ON")
     elif endpoint == 'LightsOff':
-        return False, "Lights not supported", None
+        return True, "LIGHTS OFF", lambda cs: cs.send_lights("OFF")
     elif endpoint == 'LightsAuto':
-        return False, "Lights not supported", None
+        return True, "LIGHTS AUTO", lambda cs: cs.send_lights("AUTO")
     else:
         return False, f"Unknown endpoint: {endpoint}", None
 
@@ -332,20 +296,21 @@ def serve_fonts(filename):
 
 @app.route('/<path:endpoint>')
 def handle_command(endpoint):
-    """Handle all dashboard commands and translate to UART."""
+    """Handle all dashboard commands and translate to ESP32 commands."""
     args = request.args.to_dict()
 
-    success, message, uart_cmd = translate_http_to_uart(endpoint, args)
+    success, message, action = translate_http_to_uart(endpoint, args)
 
     if not success:
         return jsonify({'error': message}), 400
 
-    if uart_cmd is None:
+    if action is None:
         return jsonify({'status': 'ok', 'message': message}), 200
 
-    cmd_success, cmd_message = write_uart_command(uart_cmd)
+    if command_sender is None or not serial_conn or not serial_conn.is_open:
+        return jsonify({'error': 'Failed to send UART command: Serial port not connected'}), 500
 
-    if cmd_success:
+    if action(command_sender):
         # Mantener current_speed del SignController sincronizado con la velocidad
         # que el dashboard manda, para que last_speed_before_stop sea siempre correcto.
         if sign_detection_controller is not None:
@@ -362,9 +327,9 @@ def handle_command(endpoint):
             # driveStop y brake no actualizan current_speed: queremos conservar
             # last_speed_before_stop como referencia para el resume.
 
-        return jsonify({'status': 'ok', 'message': message, 'uart_command': uart_cmd}), 200
+        return jsonify({'status': 'ok', 'message': message}), 200
     else:
-        return jsonify({'error': f'Failed to send UART command: {cmd_message}'}), 500
+        return jsonify({'error': 'Failed to send UART command'}), 500
 
 
 @app.route('/proxy/<path:endpoint>')
@@ -406,6 +371,40 @@ def open_serial(port: str, baud: int = UART_BAUD_RATE):
     ser.reset_input_buffer()
     ser.reset_output_buffer()
     return ser
+
+
+def arm_when_ready():
+    """Fallback arm: if opening the port did not reboot the ESP32, no SYSTEM_READY arrives."""
+    if esp32_ready_event.wait(ESP32_BOOT_TIMEOUT):
+        return  # parse_system_events already armed on EVENT:SYSTEM_READY
+    print(f"[Dashboard] No EVENT:SYSTEM_READY after {ESP32_BOOT_TIMEOUT}s, arming anyway")
+    if command_sender is not None:
+        command_sender.send_arm()
+
+
+def connect_serial(port: str):
+    """Open the ESP32 port, start reader + heartbeat and arm once the board has booted."""
+    global serial_conn, serial_read_buffer, command_sender
+
+    if serial_conn and serial_conn.is_open:
+        stop_serial_reader()
+        serial_conn.close()
+
+    esp32_ready_event.clear()
+    serial_conn = open_serial(port, UART_BAUD_RATE)
+    serial_read_buffer = ""  # Clear buffer on new connection
+
+    # Initialize command sender immediately after connection
+    if command_sender is None:
+        command_sender = CommandSender(write_uart_command)
+    command_sender.reset_link_state()
+
+    time.sleep(0.1)
+    start_serial_reader()
+    print("[Dashboard] Started serial reader")
+    start_heartbeat_sender()
+    print("[Dashboard] Started heartbeat sender")
+    threading.Thread(target=arm_when_ready, daemon=True).start()
 
 
 def read_available_lines(ser):
@@ -500,8 +499,8 @@ def read_available_lines(ser):
 
 
 def parse_system_events(line: str):
-    """Parse system state and mode events from serial messages."""
-    global system_state
+    """Parse ESP32 protocol events (EVENT:...) for state tracking. Debug lines are ignored."""
+    global system_state, ultra_last_event_time
 
     if line.startswith('EVENT:STATE_CHANGED:'):
         # Extract only the first word to avoid trailing garbage/extra messages
@@ -511,47 +510,41 @@ def parse_system_events(line: str):
         with system_state_lock:
             system_state['state'] = state
             print(f"[SystemState] State changed to: {state} (raw: {raw_state})")
-    elif line.startswith('EVENT:MODE_CHANGED:'):
-        # Extract only the first word
-        raw_mode = line.replace('EVENT:MODE_CHANGED:', '').strip()
-        mode = raw_mode.split()[0] if raw_mode else raw_mode
-        
-        with system_state_lock:
-            system_state['mode'] = mode
-            print(f"[SystemState] Mode changed to: {mode} (raw: {raw_mode})")
-    elif line.startswith('@kl:'):
-        raw_value = line.replace('@kl:', '').replace(';;', '').strip()
-        try:
-            kl_value = int(raw_value)
-        except ValueError:
-            kl_value = None
-
-        if kl_value == 0:
-            state = "DISARMED"
-            mode = "MANUAL"
-        elif kl_value == 15:
-            state = "ARMED"
-            mode = "MANUAL"
-        elif kl_value == 30:
-            state = "RUNNING"
-            mode = "AUTO"
-        else:
-            state = "UNKNOWN"
-            mode = "MANUAL"
-
-        with system_state_lock:
-            system_state['state'] = state
-            system_state['mode'] = mode
-            print(f"[SystemState] KL update: {kl_value} -> {state}/{mode}")
-    elif line.startswith('@shutdown:'):
-        with system_state_lock:
-            system_state['state'] = "SHUTDOWN"
-            print("[SystemState] Shutdown reported by STM32")
+    elif line.startswith('EVENT:SYSTEM_READY'):
+        # The board (re)booted: nothing is latched and it is DISARMED. Arm it again,
+        # like the ROS2 bridge does; nothing moves until a new C:SET_SPEED arrives.
+        print("[SystemState] ESP32 ready")
+        esp32_ready_event.set()
+        if command_sender is not None:
+            command_sender.reset_link_state()
+            command_sender.send_arm()
+    elif line.startswith('EVENT:WATCHDOG_TIMEOUT') or line.startswith('EVENT:ESTOP_TRIGGERED'):
+        # FAULT is never cleared automatically: re-arm from the dashboard
+        print(f"[SystemState] ESP32 fault: {line}", file=sys.stderr)
+    elif line.startswith('EVENT:OBSTACLE_DETECTED'):
+        raw_dist = line.replace('EVENT:OBSTACLE_DETECTED', '').lstrip(':').strip()
+        with ultra_status_lock:
+            ultra_last_event_time = time.time()
+            ultra_last_status['ultra_blocking'] = True
+            ultra_last_status['dist_cm'] = int(raw_dist) if raw_dist.isdigit() else None
+        print(f"[UltraSafety] ESP32 stopped - obstacle at {raw_dist} cm")
+    elif line.startswith('EVENT:OBSTACLE_CLEARED'):
+        with ultra_status_lock:
+            ultra_last_event_time = time.time()
+            ultra_last_status['ultra_blocking'] = False
+            ultra_last_status['dist_cm'] = None
+        # The ESP32 cleared the latched speed when it stopped: re-send the last one
+        # the brain asked for (it may have changed while the car was held).
+        if ultra_safety_enabled and command_sender is not None:
+            if command_sender.resend_last_speed():
+                print(f"[UltraSafety] Clear path - restored speed {command_sender.last_speed}")
+            else:
+                print("[UltraSafety] Clear path - no speed restoration needed")
 
 
 def serial_reader_worker():
     """Background thread that reads from serial port."""
-    global serial_conn, serial_reader_running, event_clients, sign_detection_controller, ultra_last_ui_speed
+    global serial_conn, serial_reader_running, event_clients
 
     while serial_reader_running:
         if serial_conn and serial_conn.is_open:
@@ -561,16 +554,6 @@ def serial_reader_worker():
                     if line:
                         # Parse system events for state tracking
                         parse_system_events(line)
-                        if line.startswith('@speed:'):
-                            raw_speed = line.replace('@speed:', '').replace(';;', '').strip()
-                            try:
-                                speed_mm_s = int(raw_speed)
-                                ui_speed = int(round((abs(speed_mm_s) / 500) * 255))
-                                ultra_last_ui_speed = ui_speed
-                                if sign_detection_controller is not None:
-                                    sign_detection_controller.update_current_speed(ui_speed)
-                            except ValueError:
-                                pass
 
                         # Broadcast message to all connected SSE clients
                         message_data = {
@@ -623,7 +606,7 @@ def stop_serial_reader():
 
 
 def heartbeat_worker():
-    """Send #alive to Nucleo so watchdog does not stop the motors (every 50ms when UART connected)."""
+    """Send M:PING:0 to the ESP32 so its link watchdog (300 ms) does not FAULT (every 50ms when UART connected)."""
     global serial_conn, heartbeat_sender_running, command_sender
 
     while heartbeat_sender_running:
@@ -632,7 +615,7 @@ def heartbeat_worker():
                 command_sender.send_heartbeat()
             except Exception as e:
                 print(f"[Heartbeat] Error: {e}", file=sys.stderr)
-        time.sleep(0.05)  # 50ms; Nucleo watchdog typically ~120ms
+        time.sleep(0.05)  # 50ms (20 Hz); ESP32 watchdog is 300 ms
 
     print("[Heartbeat] Worker thread stopped")
 
@@ -656,168 +639,6 @@ def stop_heartbeat_sender():
     if heartbeat_sender_thread:
         heartbeat_sender_thread.join(timeout=1.0)
         heartbeat_sender_thread = None
-
-
-ULTRA_UART_PORT = "/dev/ttyTHS1"
-ULTRA_UART_BAUD = 115200
-ULTRA_STALE_SECONDS = 0.25
-ULTRA_CHECK_INTERVAL = 0.05
-ULTRA_CLEAR_DELAY = 0.2
-ULTRA_MIN_STOP_INTERVAL = 0.2
-
-
-def start_ultra_thread():
-    """Start ultrasonic UART reader thread (ESP32 -> Jetson)."""
-    global ultra_thread
-
-    if ThreadUltraUART is None:
-        print("[UltraUART] ThreadUltraUART unavailable; ultrasonic safety disabled.", file=sys.stderr)
-        return
-
-    if ultra_thread is None or not ultra_thread.is_alive():
-        ultra_thread = ThreadUltraUART(
-            port=ULTRA_UART_PORT,
-            baud=ULTRA_UART_BAUD,
-            stale_s=ULTRA_STALE_SECONDS,
-        )
-        ultra_thread.start()
-        print(f"[UltraUART] Start requested on {ULTRA_UART_PORT} @ {ULTRA_UART_BAUD}")
-
-
-def stop_ultra_thread():
-    """Stop ultrasonic UART reader thread."""
-    global ultra_thread
-
-    if ultra_thread is not None:
-        try:
-            ultra_thread.stop()
-            ultra_thread.join(timeout=1.0)
-        except Exception as e:
-            print(f"[UltraUART] Stop error: {e}", file=sys.stderr)
-        ultra_thread = None
-
-
-def ultra_safety_worker():
-    """Safety supervisor: obstacle => speed 0, clear => restore previous speed."""
-    global ultra_safety_running, command_sender, sign_detection_controller, ultra_last_ui_speed, ultra_last_status
-
-    ultra_blocking = False
-    saved_speed_ui = None
-    clear_since = None
-    last_cmd_time = 0.0
-
-    while ultra_safety_running:
-        time.sleep(ULTRA_CHECK_INTERVAL)
-
-        if not ultra_safety_enabled:
-            continue
-
-        if ultra_thread is None or not ultra_thread.is_alive():
-            continue
-
-        state = ultra_thread.get_state_copy()
-        stale = ultra_thread.is_stale()
-        now = time.time()
-        age_ms = int((now - state.t) * 1000) if state.t > 0 else None
-
-        with ultra_status_lock:
-            ultra_last_status = {
-                "ultra_blocking": ultra_blocking,
-                "saved_speed_ui": saved_speed_ui,
-                "stale": stale,
-                "valid": bool(state.valid),
-                "present": bool(state.present),
-                "dist_cm": state.dist_cm,
-                "last_update_age_ms": age_ms,
-            }
-
-        if not state.valid or stale:
-            clear_since = None
-            continue
-
-        # Obstacle present: enter/maintain blocking
-        if state.present:
-            clear_since = None
-
-            if not ultra_blocking:
-                current_speed_ui = ultra_last_ui_speed
-                if sign_detection_controller is not None:
-                    try:
-                        with sign_detection_controller.lock:
-                            current_speed_ui = int(sign_detection_controller.current_speed)
-                    except Exception:
-                        pass
-
-                # Save only non-zero speed, and only on block transition.
-                if current_speed_ui > 0 and saved_speed_ui is None:
-                    saved_speed_ui = current_speed_ui
-
-                if now - last_cmd_time >= ULTRA_MIN_STOP_INTERVAL and command_sender is not None:
-                    sent = command_sender.send_speed_command(0)
-                    if sent:
-                        ultra_blocking = True
-                        last_cmd_time = now
-                        print(
-                            f"[UltraSafety] Blocking - obstacle at {state.dist_cm} cm, "
-                            f"saved_speed={saved_speed_ui}"
-                        )
-            else:
-                # Maintain stop with rate limit to avoid command spam.
-                if now - last_cmd_time >= ULTRA_MIN_STOP_INTERVAL and command_sender is not None:
-                    sent = command_sender.send_speed_command(0)
-                    if sent:
-                        last_cmd_time = now
-            continue
-
-        # No obstacle present, while currently blocking -> restore after stable clear delay
-        if ultra_blocking:
-            if clear_since is None:
-                clear_since = now
-
-            if (now - clear_since) < ULTRA_CLEAR_DELAY:
-                continue
-
-            restored_speed = saved_speed_ui
-            if (
-                restored_speed is not None
-                and restored_speed > 0
-                and command_sender is not None
-                and (now - last_cmd_time) >= ULTRA_MIN_STOP_INTERVAL
-            ):
-                sent = command_sender.send_speed_command(int(restored_speed))
-                if sent:
-                    last_cmd_time = now
-                    print(f"[UltraSafety] Restored speed to {restored_speed}")
-                else:
-                    print("[UltraSafety] Failed to restore speed command", file=sys.stderr)
-            else:
-                print(f"[UltraSafety] Clear path - no speed restoration needed (saved_speed={restored_speed})")
-
-            ultra_blocking = False
-            saved_speed_ui = None
-            clear_since = None
-
-
-def start_ultra_safety():
-    """Start UltraSafety supervisor thread."""
-    global ultra_safety_thread, ultra_safety_running
-
-    if ultra_safety_thread is None or not ultra_safety_thread.is_alive():
-        ultra_safety_running = True
-        ultra_safety_thread = threading.Thread(target=ultra_safety_worker, daemon=True)
-        ultra_safety_thread.start()
-        print("[UltraSafety] Supervisor started")
-
-
-def stop_ultra_safety():
-    """Stop UltraSafety supervisor thread."""
-    global ultra_safety_running, ultra_safety_thread
-
-    ultra_safety_running = False
-    if ultra_safety_thread:
-        ultra_safety_thread.join(timeout=1.0)
-        ultra_safety_thread = None
-        print("[UltraSafety] Supervisor stopped")
 
 
 def autopilot_status_broadcast_worker():
@@ -1142,9 +963,7 @@ def initialize_sign_detection_if_needed():
 
 @app.route('/uart/connect', methods=['POST'])
 def uart_connect():
-    """Connect to Nucleo (STM32) via UART."""
-    global serial_conn, serial_read_buffer, command_sender
-
+    """Connect to the ESP32 via UART."""
     if not SERIAL_AVAILABLE:
         return jsonify({'error': 'pyserial not installed'}), 500
 
@@ -1155,24 +974,8 @@ def uart_connect():
         return jsonify({'error': 'Port not specified'}), 400
 
     try:
-        if serial_conn and serial_conn.is_open:
-            stop_serial_reader()
-            serial_conn.close()
-            serial_read_buffer = ""  # Clear buffer on reconnect
+        connect_serial(port)
 
-        serial_conn = open_serial(port, UART_BAUD_RATE)
-        serial_read_buffer = ""  # Clear buffer on new connection
-        
-        # Initialize command sender immediately after connection
-        if command_sender is None:
-            command_sender = CommandSender(write_uart_command)
-            
-        time.sleep(0.1)
-        start_serial_reader()
-        print("[Dashboard] Started serial reader")
-        start_heartbeat_sender()
-        print("[Dashboard] Started heartbeat sender")
-        
         response = {
             'status': 'ok',
             'message': f'Connected to {port}',
@@ -1186,7 +989,7 @@ def uart_connect():
 
 @app.route('/uart/disconnect', methods=['POST'])
 def uart_disconnect():
-    """Disconnect from Nucleo (UART)."""
+    """Disconnect from the ESP32 (UART)."""
     global serial_conn, serial_read_buffer, autopilot_controller, sign_detection_controller, sign_detector
 
     stop_serial_reader()
@@ -1204,6 +1007,9 @@ def uart_disconnect():
             sign_detector.stop()
 
     if serial_conn and serial_conn.is_open:
+        # Leave the ESP32 safe instead of waiting for its watchdog to FAULT
+        if command_sender is not None:
+            command_sender.send_disarm()
         serial_conn.close()
         serial_conn = None
     
@@ -1219,8 +1025,6 @@ def events_stream():
     start_serial_reader()
     start_autopilot_status_broadcast()
     start_sign_detection_status_broadcast()
-    start_ultra_thread()
-    start_ultra_safety()
     
     def generate():
         # Create a dedicated queue for this client
@@ -1759,7 +1563,7 @@ def debug_sign_detections():
 @app.route('/health')
 def health():
     """Health check endpoint."""
-    global serial_conn, serial_reader_running, video_streamer, autopilot_controller, sign_detection_controller, ultra_last_status
+    global serial_conn, serial_reader_running, video_streamer, autopilot_controller, sign_detection_controller
     port_name = None
     if serial_conn and serial_conn.is_open:
         port_name = serial_conn.port
@@ -1774,6 +1578,8 @@ def health():
 
     with ultra_status_lock:
         ultra_status_info = dict(ultra_last_status)
+        if ultra_last_event_time is not None:
+            ultra_status_info['last_event_age_ms'] = int((time.time() - ultra_last_event_time) * 1000)
     
     return jsonify({
         'status': 'ok',
@@ -1785,9 +1591,8 @@ def health():
         'video_streamer_initialized': video_streamer is not None,
         'autopilot_status': autopilot_status_info,
         'sign_detection_status': sign_detection_status_info,
+        'esp32_state': system_state['state'],
         'ultra_safety_enabled': ultra_safety_enabled,
-        'ultra_uart_alive': ultra_thread is not None and ultra_thread.is_alive(),
-        'ultra_safety_alive': ultra_safety_thread is not None and ultra_safety_thread.is_alive(),
         'ultra_status': ultra_status_info
     })
 
@@ -1811,7 +1616,7 @@ def select_port_interactive() -> str:
 
     ports = list(serial_list_ports.comports())
     if not ports:
-        print("No serial ports found. Connect the Nucleo (ST-Link USB) and try again.")
+        print("No serial ports found. Connect the ESP32 (USB) and try again.")
         return None
     if len(ports) == 1:
         selected = ports[0].device
@@ -1844,7 +1649,7 @@ def _main():
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind to (default: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=5000, help='Port to bind to (default: 5000)')
     parser.add_argument('--debug', action='store_true', help='Run in debug mode')
-    parser.add_argument('--port-name', dest='port_name', default=None, help='Serial port to connect to (e.g. /dev/ttyACM0)')
+    parser.add_argument('--port-name', dest='port_name', default=None, help='Serial port to connect to (e.g. /dev/ttyCH341USB0 on the Jetson)')
     parser.add_argument('--auto-connect', dest='auto_connect', action='store_true', help='Interactively select serial port on startup')
     parser.add_argument('--lane-detection', dest='lane_detection', action='store_true', help='Start lane detection (autopilot) when UART connected')
     parser.add_argument('--sign-detection', dest='sign_detection', action='store_true', help='Start sign detection when UART connected')
@@ -1853,7 +1658,7 @@ def _main():
     local_ip = get_local_ip()
 
     print("=" * 70)
-    print(" " * 15 + "Car Control Dashboard (Nucleo/STM32)")
+    print(" " * 15 + "Car Control Dashboard (ESP32)")
     print("=" * 70)
     print()
 
@@ -1864,10 +1669,7 @@ def _main():
         if SERIAL_AVAILABLE:
             try:
                 print(f"   Connecting to {args.port_name}...", end=" ")
-                serial_conn = open_serial(args.port_name, UART_BAUD_RATE)
-                time.sleep(0.1)
-                start_serial_reader()
-                start_heartbeat_sender()
+                connect_serial(args.port_name)
                 print(f"✓ Connected at {UART_BAUD_RATE} baud")
                 uart_connected = True
             except Exception as e:
@@ -1881,10 +1683,7 @@ def _main():
             if selected_port:
                 try:
                     print(f"   Connecting to {selected_port}...", end=" ")
-                    serial_conn = open_serial(selected_port, UART_BAUD_RATE)
-                    time.sleep(0.1)
-                    start_serial_reader()
-                    start_heartbeat_sender()
+                    connect_serial(selected_port)
                     print(f"✓ Connected at {UART_BAUD_RATE} baud")
                     uart_connected = True
                 except Exception as e:
@@ -1897,13 +1696,6 @@ def _main():
     else:
         print("   ⚠ Not connected. Use the dashboard to connect manually.")
         print("   Tip: Use --auto-connect to select a port on startup, or --port-name to specify one.")
-    print()
-
-    print("🛰️  UltraSafety Initialization")
-    print("-" * 70)
-    start_ultra_thread()
-    start_ultra_safety()
-    print("   ℹ Ultra UART reader and safety supervisor requested.")
     print()
 
     if uart_connected:
