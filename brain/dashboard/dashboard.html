@@ -87,35 +87,6 @@
                 </label>
               </div>
             </div>
-            <div
-              style="
-                display: flex;
-                gap: 8px;
-                margin-bottom: 8px;
-                align-items: center;
-                justify-content: center;
-              "
-            >
-              <span style="font-size: 10px; font-weight: bold">Lights:</span>
-              <label class="toggle-switch">
-                <input
-                  type="checkbox"
-                  id="lights-toggle"
-                  onchange="toggleLights(this.checked)"
-                />
-                <span class="toggle-slider"></span>
-              </label>
-              <span style="font-size: 10px">Manual</span>
-              <label class="toggle-switch">
-                <input
-                  type="checkbox"
-                  id="lights-auto-toggle"
-                  onchange="toggleLightsAuto(this.checked)"
-                />
-                <span class="toggle-slider"></span>
-              </label>
-              <span style="font-size: 10px">Auto</span>
-            </div>
             <button
               class="btn btn-warning"
               onclick="sendCommand('brake')"
@@ -717,18 +688,6 @@
                 }
               }
             }
-          } else if (message === "EVENT:CMD_EXECUTED:SET_STEER_CENTER") {
-            // Center steering
-            const steerSlider = document.getElementById("steer-slider");
-            const steerValue = document.getElementById("steer-value");
-            const steerDisplay = document.getElementById("steer-display");
-
-            if (steerSlider && steerValue && steerDisplay) {
-              const center = 105;
-              steerSlider.value = center;
-              steerValue.textContent = `${center}°`;
-              steerDisplay.textContent = "Center: 105°";
-            }
           }
         }
       }
@@ -861,7 +820,7 @@
           const armToggle = document.getElementById("arm-toggle");
           if (armToggle) {
             armToggle.checked =
-              state === "ARMED" || state === "RUNNING" || state === "STOPPED";
+              state === "RUNNING" || state === "STOPPED";
           }
         }
 
@@ -1489,24 +1448,6 @@
           sendCommand("mode?value=AUTO");
         } else {
           sendCommand("mode?value=MANUAL");
-        }
-      }
-
-      function toggleLights(checked) {
-        if (checked) {
-          sendCommand("LightsOn");
-          document.getElementById("lights-auto-toggle").checked = false;
-        } else {
-          sendCommand("LightsOff");
-        }
-      }
-
-      function toggleLightsAuto(checked) {
-        if (checked) {
-          sendCommand("LightsAuto");
-          document.getElementById("lights-toggle").checked = false;
-        } else {
-          sendCommand("LightsOff");
         }
       }
 

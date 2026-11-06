@@ -264,12 +264,6 @@ def translate_http_to_uart(endpoint: str, args: dict):
         return True, "RIGHT", lambda cs: cs.send_steering_command(SERVO_RIGHT)
     elif endpoint == 'steerStop':
         return True, "CENTER", lambda cs: cs.send_steering_command(SERVO_CENTER)
-    elif endpoint == 'LightsOn':
-        return True, "LIGHTS ON", lambda cs: cs.send_lights("ON")
-    elif endpoint == 'LightsOff':
-        return True, "LIGHTS OFF", lambda cs: cs.send_lights("OFF")
-    elif endpoint == 'LightsAuto':
-        return True, "LIGHTS AUTO", lambda cs: cs.send_lights("AUTO")
     else:
         return False, f"Unknown endpoint: {endpoint}", None
 
@@ -508,8 +502,17 @@ def parse_system_events(line: str):
         state = raw_state.split()[0] if raw_state else raw_state
         
         with system_state_lock:
+            previous = system_state['state']
             system_state['state'] = state
             print(f"[SystemState] State changed to: {state} (raw: {raw_state})")
+
+        # DISARMED and FAULT center the servo on the ESP32, but the autopilot
+        # only sends C:SET_STEER when its angle changes, so after re-arming it
+        # would never re-send it. Forget the last angle when the car becomes
+        # drivable again: the next autopilot cycle re-sends it.
+        if state == 'RUNNING' and previous not in ('RUNNING', 'STOPPED'):
+            if autopilot_controller is not None:
+                autopilot_controller.invalidate_steering()
     elif line.startswith('EVENT:SYSTEM_READY'):
         # The board (re)booted: nothing is latched and it is DISARMED. Arm it again,
         # like the ROS2 bridge does; nothing moves until a new C:SET_SPEED arrives.

@@ -4,7 +4,7 @@ Command Sender Module - Sends commands to the ESP32 (Bosch-Aura/embedded) via UA
 Protocol (embedded/docs/BRAIN_TEAM_PROTOCOL.md): CHANNEL:COMMAND:VALUE\n
     C = control (SET_SPEED, SET_STEER, SET_DIR)
     E = emergency (BRAKE_NOW)
-    M = management (PING, SYS_ARM, SYS_DISARM, LIGHTS_*)
+    M = management (PING, SYS_ARM, SYS_DISARM)
 
 Speed and steering are *latching* on the ESP32: one command holds until the next
 one. The link watchdog (300 ms) is fed with M:PING:0 from the dashboard heartbeat.
@@ -130,7 +130,8 @@ class CommandSender:
 
     def send_brake(self) -> bool:
         """
-        Emergency brake (E:BRAKE_NOW). The ESP32 locks traction for 5 s afterwards.
+        Emergency brake (E:BRAKE_NOW). One-shot: the ESP32 brakes and drops the latched
+        speed, and the next C:SET_SPEED moves the car again (no lock-out).
 
         Returns:
             True if command was sent successfully, False otherwise
@@ -148,10 +149,6 @@ class CommandSender:
         with self.lock:
             self.last_speed = 0
         return self._send(format_command("M", "SYS_DISARM"))
-
-    def send_lights(self, mode: str) -> bool:
-        """Set headlights: mode is 'ON', 'OFF' or 'AUTO' (M:LIGHTS_<mode>)."""
-        return self._send(format_command("M", f"LIGHTS_{mode.upper()}"))
 
     def send_heartbeat(self) -> bool:
         """

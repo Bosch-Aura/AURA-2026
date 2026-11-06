@@ -145,6 +145,32 @@ class AutoPilotController:
             self.filter_controller.reset()
             print("[AutoPilotController] Resumed")
 
+    def _send_servo_if_changed(self, steering_angle: float, servo_angle: int) -> None:
+        """Send C:SET_STEER only when the servo value changes (prevents UART spam)."""
+        with self.lock:
+            should_send = self.last_servo_angle != servo_angle
+            self.last_steering_angle = steering_angle  # always, for the dashboard
+        if not should_send:
+            return
+        success = self.command_sender.send_steering_command(servo_angle)
+        with self.lock:
+            self.last_servo_angle = servo_angle
+            if success:
+                self.command_count += 1
+            else:
+                self.error_count += 1
+
+    def invalidate_steering(self) -> None:
+        """
+        Forget the last servo value sent, so the next cycle re-sends it.
+
+        Call when the ESP32 re-arms (DISARMED/FAULT -> RUNNING): it centered the
+        servo meanwhile, and the change-only filter above would otherwise never
+        send the angle again while the PID output stays the same.
+        """
+        with self.lock:
+            self.last_servo_angle = None
+
     def start_timed_steering_override(self, steering_angle_deg: float, duration_s: float, label: str = 'manual_override'):
         """Apply a temporary steering override without stopping the autopilot thread."""
         duration_s = max(0.0, float(duration_s))
@@ -216,25 +242,7 @@ class AutoPilotController:
                 if override_active:
                     steering_angle = override_angle
                     servo_angle = self.angle_converter.convert(steering_angle, inverted=True)
-
-                    should_send = False
-                    with self.lock:
-                        if self.last_servo_angle != servo_angle:
-                            should_send = True
-
-                    if should_send:
-                        success = self.command_sender.send_steering_command(servo_angle)
-                        with self.lock:
-                            self.last_steering_angle = steering_angle
-                            self.last_servo_angle = servo_angle
-                            if success:
-                                self.command_count += 1
-                            else:
-                                self.error_count += 1
-                    else:
-                        with self.lock:
-                            self.last_steering_angle = steering_angle
-
+                    self._send_servo_if_changed(steering_angle, servo_angle)
                     time.sleep(0.033)
                     continue
                 
@@ -285,26 +293,7 @@ class AutoPilotController:
                 #print(f"Angle Converter: Servo angle: {servo_angle}")
                 
                 # Send command to ESP32 only if it changed (prevent UART spam)
-                should_send = False
-                with self.lock:
-                    if self.last_servo_angle != servo_angle:
-                        should_send = True
-                
-                if should_send:
-                    success = self.command_sender.send_steering_command(servo_angle)
-                    
-                    # Update statistics
-                    with self.lock:
-                        self.last_steering_angle = steering_angle
-                        self.last_servo_angle = servo_angle
-                        if success:
-                            self.command_count += 1
-                        else:
-                            self.error_count += 1
-                else:
-                    # Just update steering angle for dashboard, even if we didn't send command
-                    with self.lock:
-                        self.last_steering_angle = steering_angle
+                self._send_servo_if_changed(steering_angle, servo_angle)
                 
                 # Control loop rate (~30 FPS)
                 time.sleep(0.033)
