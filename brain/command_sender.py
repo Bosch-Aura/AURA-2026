@@ -4,7 +4,7 @@ Command Sender Module - Sends commands to the ESP32 (Bosch-Aura/embedded) via UA
 Protocol (embedded/docs/BRAIN_TEAM_PROTOCOL.md): CHANNEL:COMMAND:VALUE\n
     C = control (SET_SPEED, SET_STEER, SET_DIR)
     E = emergency (BRAKE_NOW)
-    M = management (PING, SYS_ARM, SYS_DISARM)
+    M = management (PING, SYS_ARM, SYS_DISARM, OBSTACLE_RESET)
 
 Speed and steering are *latching* on the ESP32: one command holds until the next
 one. The link watchdog (300 ms) is fed with M:PING:0 from the dashboard heartbeat.
@@ -149,6 +149,17 @@ class CommandSender:
         with self.lock:
             self.last_speed = 0
         return self._send(format_command("M", "SYS_DISARM"))
+
+    def send_obstacle_reset(self) -> bool:
+        """
+        Release the ESP32 ultrasonic hold (M:OBSTACLE_RESET).
+
+        The ESP32 only clears an obstacle on valid far readings, so with nothing
+        in range after the obstacle is removed it would wait forever. If the
+        obstacle is still there it blocks again after a few readings. The
+        ESP32 answers with EVENT:OBSTACLE_CLEARED, which re-sends the last speed.
+        """
+        return self._send(format_command("M", "OBSTACLE_RESET"))
 
     def send_heartbeat(self) -> bool:
         """

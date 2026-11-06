@@ -167,10 +167,16 @@ sign_detection_initializing = False  # True while loading YOLO model in backgrou
 # UltraSafety: the ESP32 stops by itself on an obstacle (STOPPED) and reports it with
 # EVENT:OBSTACLE_DETECTED / EVENT:OBSTACLE_CLEARED. On clear it does NOT resume the
 # latched speed, so the Jetson re-sends the last requested speed.
+# Only forward motion is blocked: backing away works while the obstacle is there.
+# It clears only on valid far readings; with nothing in range it waits forever, so
+# the dashboard can release it with M:OBSTACLE_RESET. EVENT:ULTRASONIC_SILENT /
+# ULTRASONIC_OK report a sensor with no valid readings (open space or dead sensor);
+# they are informational, the ESP32 does not brake for them.
 ultra_safety_enabled = True
 ultra_last_status = {
     "ultra_blocking": False,
     "dist_cm": None,
+    "sensor_silent": False,
     "last_event_age_ms": None,
 }
 ultra_last_event_time = None
@@ -225,6 +231,8 @@ def translate_http_to_uart(endpoint: str, args: dict):
         with system_state_lock:
             system_state['mode'] = value
         return True, f"MODE: {value}", None
+    elif endpoint == 'obstacleReset':
+        return True, "OBSTACLE RESET", lambda cs: cs.send_obstacle_reset()
     elif endpoint == 'brake':
         return True, "BRAKE", lambda cs: cs.send_brake()
     elif endpoint == 'forward':
@@ -531,6 +539,12 @@ def parse_system_events(line: str):
             ultra_last_status['ultra_blocking'] = True
             ultra_last_status['dist_cm'] = int(raw_dist) if raw_dist.isdigit() else None
         print(f"[UltraSafety] ESP32 stopped - obstacle at {raw_dist} cm")
+    elif line.startswith('EVENT:ULTRASONIC_SILENT') or line.startswith('EVENT:ULTRASONIC_OK'):
+        silent = line.startswith('EVENT:ULTRASONIC_SILENT')
+        with ultra_status_lock:
+            ultra_last_status['sensor_silent'] = silent
+        if silent:
+            print("[UltraSafety] No valid ultrasonic readings: open space or sensor fault", file=sys.stderr)
     elif line.startswith('EVENT:OBSTACLE_CLEARED'):
         with ultra_status_lock:
             ultra_last_event_time = time.time()

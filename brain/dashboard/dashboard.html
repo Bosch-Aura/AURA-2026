@@ -94,6 +94,14 @@
             >
               EMERGENCY BRAKE
             </button>
+            <button
+              class="btn btn-secondary"
+              onclick="sendCommand('obstacleReset')"
+              style="width: 100%; margin-top: 5px"
+              title="Release the ultrasonic hold when the obstacle is gone and nothing is in range"
+            >
+              RESET OBSTACLE
+            </button>
           </div>
 
           <!-- Motor Control -->
@@ -660,6 +668,10 @@
             log(`Obstacle ahead - ESP32 stopped the car (${message})`, "error");
           } else if (message.startsWith("EVENT:OBSTACLE_CLEARED")) {
             log("Obstacle cleared - resuming last speed", "success");
+          } else if (message.startsWith("EVENT:ULTRASONIC_SILENT")) {
+            log("Ultrasonic: no valid readings (open space or sensor fault)", "error");
+          } else if (message.startsWith("EVENT:ULTRASONIC_OK")) {
+            log("Ultrasonic: valid readings again", "success");
           } else if (message.startsWith("EVENT:CMD_EXECUTED:SET_STEER:")) {
             // Update steering slider and display
             const angleStr = message
