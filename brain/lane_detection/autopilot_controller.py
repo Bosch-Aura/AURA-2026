@@ -143,18 +143,22 @@ class AutoPilotController:
             # Reset controllers to avoid jumps
             self.pid_controller.reset()
             self.filter_controller.reset()
+            # Whoever paused us (a maneuver, the dashboard) may have moved the
+            # servo: re-send the angle even if the PID gives the same value.
+            self.last_servo_angle = None
             print("[AutoPilotController] Resumed")
 
     def _send_servo_if_changed(self, steering_angle: float, servo_angle: int) -> None:
         """Send C:SET_STEER only when the servo value changes (prevents UART spam)."""
+        # Claim the value under the lock BEFORE sending: if invalidate_steering()
+        # runs while the command is going out, its None is not overwritten.
         with self.lock:
-            should_send = self.last_servo_angle != servo_angle
             self.last_steering_angle = steering_angle  # always, for the dashboard
-        if not should_send:
-            return
+            if self.last_servo_angle == servo_angle:
+                return
+            self.last_servo_angle = servo_angle
         success = self.command_sender.send_steering_command(servo_angle)
         with self.lock:
-            self.last_servo_angle = servo_angle
             if success:
                 self.command_count += 1
             else:

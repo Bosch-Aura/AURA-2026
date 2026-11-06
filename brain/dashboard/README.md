@@ -82,7 +82,11 @@ Comportamiento del enlace:
 - **Watchdog**: el heartbeat manda `M:PING:0` cada 50 ms (el ESP32 pasa a `FAULT` sin tráfico durante 300 ms). `FAULT` no se rearma solo: usar el toggle *Armed*.
 - **Velocidad**: la UI y las estrategias siguen usando 0-255. Se mapea a duty `140..255` (por debajo de 140 el motor no arranca). Marcha atrás con `C:SET_DIR:0`, enviado solo cuando cambia el sentido.
 - **Dirección**: el valor de servo (50-160) se manda tal cual. Si el auto gira al revés, poner `STEER_INVERTED = True` en `command_sender.py`.
-- **Ultrasonido**: lo maneja el ESP32 (`EVENT:OBSTACLE_DETECTED` → `STOPPED`). Al llegar `EVENT:OBSTACLE_CLEARED` el dashboard reenvía la última velocidad pedida.
+- **Ultrasonido**: lo maneja el ESP32. Con `EVENT:OBSTACLE_DETECTED` pasa a `STOPPED` y bloquea **solo el avance**: la marcha atrás y la dirección siguen funcionando. Al llegar `EVENT:OBSTACLE_CLEARED`, el dashboard reenvía la última velocidad pedida.
+  - El ESP32 despeja solo con lecturas lejanas válidas. Si se saca el obstáculo y no queda nada dentro del alcance, el auto se queda esperando: para eso está el botón **RESET OBSTACLE** (`M:OBSTACLE_RESET`). Después del reset **no** se reenvía la velocidad, porque el obstáculo podría seguir ahí: hay que mandarla a mano.
+  - Un obstáculo durante la espera o el avance del estacionamiento aborta la maniobra.
+  - `EVENT:ULTRASONIC_SILENT` / `ULTRASONIC_OK` son informativos: 2 s sin lecturas válidas (espacio abierto o sensor desconectado) y su vuelta. Se ven en `/health` como `sensor_silent`.
+- **Freno y paradas**: `E:BRAKE_NOW` frena una sola vez, sin bloqueo. Por eso EMERGENCY BRAKE, STOP, velocidad 0 y DISARM cancelan antes de frenar todo lo que las estrategias tengan programado (reanudaciones, estacionamiento). Lo mismo pasa con `FAULT`, `DISARMED` y un reinicio de la placa, que además olvidan la última velocidad: después de rearmar, el auto no se mueve hasta un comando nuevo.
 - **Modo AUTO/MANUAL**: el ESP32 no tiene modos; el toggle solo cambia el estado del lado de la Jetson.
 
 ## 📖 Documentación

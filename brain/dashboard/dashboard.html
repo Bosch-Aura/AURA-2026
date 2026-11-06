@@ -650,9 +650,6 @@
           if (message.startsWith("EVENT:STATE_CHANGED:")) {
             const state = message.replace("EVENT:STATE_CHANGED:", "").trim();
             updateStatusDisplay(state, null);
-          } else if (message.startsWith("EVENT:MODE_CHANGED:")) {
-            const mode = message.replace("EVENT:MODE_CHANGED:", "").trim();
-            updateStatusDisplay(null, mode);
           } else if (message.startsWith("EVENT:CMD_EXECUTED:SET_SPEED:")) {
             // ESP32 reports the applied PWM duty (0-255), not the UI speed:
             // show it without moving the speed slider
@@ -665,11 +662,11 @@
                 duty === 0 ? "Stopped: 0" : `Duty: ${duty}`;
             }
           } else if (message.startsWith("EVENT:OBSTACLE_DETECTED")) {
-            log(`Obstacle ahead - ESP32 stopped the car (${message})`, "error");
+            log(`Obstacle ahead - ESP32 blocked forward motion, reverse still works (${message})`, "error");
           } else if (message.startsWith("EVENT:OBSTACLE_CLEARED")) {
-            log("Obstacle cleared - resuming last speed", "success");
+            log("Obstacle cleared", "success");
           } else if (message.startsWith("EVENT:ULTRASONIC_SILENT")) {
-            log("Ultrasonic: no valid readings (open space or sensor fault)", "error");
+            log("Ultrasonic: no valid readings for 2 s (open space, or sensor fault if something is ahead)", "info");
           } else if (message.startsWith("EVENT:ULTRASONIC_OK")) {
             log("Ultrasonic: valid readings again", "success");
           } else if (message.startsWith("EVENT:CMD_EXECUTED:SET_STEER:")) {

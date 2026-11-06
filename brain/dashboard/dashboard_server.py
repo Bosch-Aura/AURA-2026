@@ -219,10 +219,20 @@ def translate_http_to_uart(endpoint: str, args: dict):
     SPEED_UI_MAX = 255
     FORWARD_SPEED = 220
 
+    def stopping(send):
+        # The ESP32 brake is one-shot: cancel what the sign strategies have
+        # scheduled (resumes, parking) BEFORE the stop goes out, so nothing
+        # queued can move the car again right after it.
+        def action(cs):
+            if sign_detection_controller is not None:
+                sign_detection_controller.cancel_pending_motion(f"dashboard {endpoint}")
+            return send(cs)
+        return action
+
     if endpoint == 'arm':
         return True, "ARM", lambda cs: cs.send_arm()
     elif endpoint == 'disarm':
-        return True, "DISARM", lambda cs: cs.send_disarm()
+        return True, "DISARM", stopping(lambda cs: cs.send_disarm())
     elif endpoint == 'mode':
         # The ESP32 has no driving modes: AUTO/MANUAL only lives on the Jetson
         value = args.get('value', '').upper()
@@ -234,13 +244,13 @@ def translate_http_to_uart(endpoint: str, args: dict):
     elif endpoint == 'obstacleReset':
         return True, "OBSTACLE RESET", lambda cs: cs.send_obstacle_reset()
     elif endpoint == 'brake':
-        return True, "BRAKE", lambda cs: cs.send_brake()
+        return True, "BRAKE", stopping(lambda cs: cs.send_brake())
     elif endpoint == 'forward':
         return True, "FORWARD", lambda cs: cs.send_speed_command(FORWARD_SPEED, "forward")
     elif endpoint == 'back':
         return True, "BACKWARD", lambda cs: cs.send_speed_command(SPEED_UI_MAX, "backward")
     elif endpoint == 'driveStop':
-        return True, "STOP", lambda cs: cs.send_speed_command(0)
+        return True, "STOP", stopping(lambda cs: cs.send_speed_command(0))
     elif endpoint == 'changeSpeed':
         speed_str = args.get('speed', '0')
         direction_str = args.get('direction', 'forward')
@@ -249,7 +259,7 @@ def translate_http_to_uart(endpoint: str, args: dict):
             if speed < 0 or speed > SPEED_UI_MAX:
                 return False, f"Speed must be 0-{SPEED_UI_MAX}", None
             if speed == 0:
-                return True, "STOP", lambda cs: cs.send_speed_command(0)
+                return True, "STOP", stopping(lambda cs: cs.send_speed_command(0))
             return (
                 True,
                 f"SPEED: {speed} ({direction_str})",
@@ -500,6 +510,20 @@ def read_available_lines(ser):
     return lines
 
 
+def halt_jetson_motion(reason: str):
+    """
+    The car must stay stopped: forget the speed the brain last asked for and
+    cancel what the sign strategies have scheduled (resumes, parking).
+
+    The ESP32 brake is one-shot and it never restarts by itself, so anything
+    still queued here is the only way the car could move again on its own.
+    """
+    if command_sender is not None:
+        command_sender.forget_speed()
+    if sign_detection_controller is not None:
+        sign_detection_controller.cancel_pending_motion(reason)
+
+
 def parse_system_events(line: str):
     """Parse ESP32 protocol events (EVENT:...) for state tracking. Debug lines are ignored."""
     global system_state, ultra_last_event_time
@@ -516,47 +540,66 @@ def parse_system_events(line: str):
 
         # DISARMED and FAULT center the servo on the ESP32, but the autopilot
         # only sends C:SET_STEER when its angle changes, so after re-arming it
-        # would never re-send it. Forget the last angle when the car becomes
-        # drivable again: the next autopilot cycle re-sends it.
-        if state == 'RUNNING' and previous not in ('RUNNING', 'STOPPED'):
+        # would never re-send it. Forget the last angle when the car is armed
+        # again: the next autopilot cycle re-sends it.
+        # Arming can land in STOPPED too (obstacle ahead or SYS_STOP latched):
+        # the servo was centered all the same.
+        if state in ('RUNNING', 'STOPPED') and previous not in ('RUNNING', 'STOPPED'):
             if autopilot_controller is not None:
                 autopilot_controller.invalidate_steering()
+        # DISARMED and FAULT drop the latched speed on the ESP32 for good.
+        if state in ('DISARMED', 'FAULT') and previous != state:
+            halt_jetson_motion(f"ESP32 {state}")
     elif line.startswith('EVENT:SYSTEM_READY'):
         # The board (re)booted: nothing is latched and it is DISARMED. Arm it again,
         # like the ROS2 bridge does; nothing moves until a new C:SET_SPEED arrives.
         print("[SystemState] ESP32 ready")
         esp32_ready_event.set()
+        with system_state_lock:
+            system_state['state'] = 'DISARMED'
+        halt_jetson_motion("ESP32 reboot")
+        # The servo is centered after a reboot. Do not rely on seeing
+        # STATE_CHANGED:DISARMED (it can be lost in the boot noise).
+        if autopilot_controller is not None:
+            autopilot_controller.invalidate_steering()
         if command_sender is not None:
             command_sender.reset_link_state()
             command_sender.send_arm()
     elif line.startswith('EVENT:WATCHDOG_TIMEOUT') or line.startswith('EVENT:ESTOP_TRIGGERED'):
         # FAULT is never cleared automatically: re-arm from the dashboard
         print(f"[SystemState] ESP32 fault: {line}", file=sys.stderr)
+        halt_jetson_motion(line.replace('EVENT:', ''))
     elif line.startswith('EVENT:OBSTACLE_DETECTED'):
         raw_dist = line.replace('EVENT:OBSTACLE_DETECTED', '').lstrip(':').strip()
         with ultra_status_lock:
             ultra_last_event_time = time.time()
             ultra_last_status['ultra_blocking'] = True
             ultra_last_status['dist_cm'] = int(raw_dist) if raw_dist.isdigit() else None
-        print(f"[UltraSafety] ESP32 stopped - obstacle at {raw_dist} cm")
+        print(f"[UltraSafety] ESP32 blocked forward motion - obstacle at {raw_dist} cm")
+        if sign_detection_controller is not None:
+            sign_detection_controller.on_obstacle_detected()
     elif line.startswith('EVENT:ULTRASONIC_SILENT') or line.startswith('EVENT:ULTRASONIC_OK'):
         silent = line.startswith('EVENT:ULTRASONIC_SILENT')
         with ultra_status_lock:
             ultra_last_status['sensor_silent'] = silent
         if silent:
-            print("[UltraSafety] No valid ultrasonic readings: open space or sensor fault", file=sys.stderr)
+            # Normal in open space; a problem only if something is in front.
+            print("[UltraSafety] No valid ultrasonic readings for 2 s (open space or sensor fault)")
     elif line.startswith('EVENT:OBSTACLE_CLEARED'):
         with ultra_status_lock:
+            was_blocking = ultra_last_status['ultra_blocking']
             ultra_last_event_time = time.time()
             ultra_last_status['ultra_blocking'] = False
             ultra_last_status['dist_cm'] = None
         # The ESP32 cleared the latched speed when it stopped: re-send the last one
-        # the brain asked for (it may have changed while the car was held).
-        if ultra_safety_enabled and command_sender is not None:
+        # the brain asked for (it may have changed while the car was held). Only if
+        # this clear ends a block we saw; resend_last_speed also skips it after an
+        # operator OBSTACLE_RESET.
+        if ultra_safety_enabled and command_sender is not None and was_blocking:
             if command_sender.resend_last_speed():
                 print(f"[UltraSafety] Clear path - restored speed {command_sender.last_speed}")
             else:
-                print("[UltraSafety] Clear path - no speed restoration needed")
+                print("[UltraSafety] Clear path - no speed to restore")
 
 
 def serial_reader_worker():

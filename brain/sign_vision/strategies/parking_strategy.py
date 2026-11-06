@@ -147,6 +147,8 @@ class ParkingStrategy(SignStrategy):
         self.phase_start_time: float = 0.0
         self.is_running: bool        = False
         self.is_parked: bool         = False
+        # Set by abort(): from then on the worker may only send speed 0.
+        self._aborted: bool          = False
 
         self._worker_thread: threading.Thread | None = None
 
@@ -192,6 +194,7 @@ class ParkingStrategy(SignStrategy):
 
             self.is_running = True
             self.is_parked = False
+            self._aborted = False
             self.phase = "WAIT"
             self.phase_start_time = now
 
@@ -231,6 +234,37 @@ class ParkingStrategy(SignStrategy):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def abort(self, reason: str) -> bool:
+        """
+        Stop the maneuver now (brake, stop, disarm, FAULT, obstacle). Returns True
+        if a maneuver was running. The worker exits on its next cycle; until then
+        _set_motion() refuses anything but speed 0, so no command slips through
+        after the brake. Lane following is resumed if parking had paused it.
+        """
+        with self.lock:
+            if not self.is_running:
+                return False
+            paused_autopilot = self.phase != "WAIT"
+            self.is_running = False
+            self._aborted = True
+            self.phase = "IDLE"
+        print(f"[ParkingStrategy] Aborted ({reason})")
+        if paused_autopilot and getattr(self.controller, "autopilot_controller", None):
+            self.controller.autopilot_controller.resume()
+        return True
+
+    def on_obstacle_detected(self) -> None:
+        """
+        The ESP32 blocks forward motion while an obstacle is ahead, but the phase
+        timers keep running: a blocked WAIT or FORWARD_LEFT would let the reverse
+        arcs start from the wrong place. Give up instead of parking crooked.
+        Reverse phases are not affected (backing away is allowed).
+        """
+        with self.lock:
+            phase = self.phase if self.is_running else None
+        if phase in ("WAIT", "FORWARD_LEFT"):
+            self.abort(f"obstacle during {phase}")
+
     def _set_motion(self, speed_ui: int, direction: str, servo_angle: int) -> None:
         """
         Send a combined speed + steering command and update controller state.
@@ -242,6 +276,9 @@ class ParkingStrategy(SignStrategy):
         """
         speed_ui = max(0, min(255, int(speed_ui)))
         direction = "backward" if direction == "backward" else "forward"
+        with self.lock:
+            if self._aborted and speed_ui > 0:
+                return
 
         ok_speed = self.controller.command_sender.send_speed_command(
             speed_ui, direction=direction

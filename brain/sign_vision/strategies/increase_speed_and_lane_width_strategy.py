@@ -12,8 +12,12 @@ class IncreaseSpeedAndLaneWidthStrategy(SignStrategy):
 
     def _reset_speed_after_delay(self, delay=3.0):
         """Reset speed and lane parameters after a delay."""
+        epoch = self.controller.motion_epoch
         print(f"[IncreaseSpeedAndLaneWidthStrategy] Waiting {delay}s before reset...")
         time.sleep(delay)
+        if self.controller.motion_epoch != epoch:
+            print("[IncreaseSpeedAndLaneWidthStrategy] Cancelled (brake/stop meanwhile): speed not reset")
+            return
         
         print("[IncreaseSpeedAndLaneWidthStrategy] Resetting parameters...")
         try:

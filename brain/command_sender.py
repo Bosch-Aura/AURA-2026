@@ -11,6 +11,7 @@ one. The link watchdog (300 ms) is fed with M:PING:0 from the dashboard heartbea
 """
 
 import threading
+import time
 
 
 # Servo values sent as-is to C:SET_STEER (firmware clamps to 50-160).
@@ -73,6 +74,9 @@ class CommandSender:
         self.last_direction = "forward"
         # Direction the ESP32 currently has; None = unknown (forces C:SET_DIR).
         self._firmware_forward = None
+        # When M:OBSTACLE_RESET was sent: the OBSTACLE_CLEARED it produces must not
+        # re-send the speed (the obstacle may still be there; the operator decides).
+        self._obstacle_reset_at = 0.0
 
     def _send(self, command: str) -> bool:
         success, _message = self.write_uart_command(command)
@@ -82,6 +86,17 @@ class CommandSender:
         """Forget what the ESP32 has latched. Call after the board (re)boots."""
         with self.lock:
             self._firmware_forward = None
+            self.last_speed = 0
+
+    def forget_speed(self):
+        """
+        The ESP32 dropped its latched speed for good (DISARMED, FAULT, reboot).
+
+        Without this, the next OBSTACLE_CLEARED would re-send a speed from before
+        the fault and the car would start by itself after being re-armed.
+        """
+        with self.lock:
+            self.last_speed = 0
 
     def send_steering_command(self, servo_angle: int) -> bool:
         """
@@ -121,10 +136,17 @@ class CommandSender:
             return self._send(format_command("C", "SET_SPEED", ui_speed_to_duty(speed)))
 
     def resend_last_speed(self) -> bool:
-        """Re-send the last requested speed (the ESP32 drops it after an obstacle stop)."""
+        """
+        Re-send the last requested speed (the ESP32 drops it after an obstacle stop).
+
+        Not after an operator OBSTACLE_RESET: the obstacle may still be there, so
+        the car stays still until someone sends a speed.
+        """
         with self.lock:
             speed, direction = self.last_speed, self.last_direction
-        if speed <= 0:
+            after_reset = time.time() - self._obstacle_reset_at < 1.0
+            self._obstacle_reset_at = 0.0
+        if speed <= 0 or after_reset:
             return False
         return self.send_speed_command(speed, direction)
 
@@ -156,9 +178,12 @@ class CommandSender:
 
         The ESP32 only clears an obstacle on valid far readings, so with nothing
         in range after the obstacle is removed it would wait forever. If the
-        obstacle is still there it blocks again after a few readings. The
-        ESP32 answers with EVENT:OBSTACLE_CLEARED, which re-sends the last speed.
+        obstacle is still there it blocks again after a few readings.
+        The OBSTACLE_CLEARED that follows does NOT re-send the last speed: the
+        car stays still until a new speed command (see resend_last_speed).
         """
+        with self.lock:
+            self._obstacle_reset_at = time.time()
         return self._send(format_command("M", "OBSTACLE_RESET"))
 
     def send_heartbeat(self) -> bool:

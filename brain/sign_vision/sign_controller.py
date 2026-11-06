@@ -57,6 +57,9 @@ class SignController:
         self.last_speed_before_stop = 0 # Última velocidad no-cero antes de un stop/slowdown.
         self.pending_resume_at = None
         self.pending_resume_speed = None
+        # Bumped by cancel_pending_motion(). Delayed actions (strategy threads)
+        # take a copy before sleeping and do nothing if it changed meanwhile.
+        self.motion_epoch = 0
         
         # Cooldowns (to prevent spamming commands)
         self.last_stop_time = 0
@@ -104,6 +107,31 @@ class SignController:
             print("[SignController] Stopped")
         
         return True
+
+    def cancel_pending_motion(self, reason: str) -> None:
+        """
+        Drop every speed the strategies have scheduled and abort running maneuvers.
+
+        Call when the car must stay stopped: brake, stop, disarm, FAULT, reboot.
+        The ESP32 brake is one-shot (no lock-out), so a resume scheduled before
+        the brake would otherwise move the car again a few seconds later.
+        """
+        with self.lock:
+            had_resume = self.pending_resume_at is not None
+            self.pending_resume_at = None
+            self.pending_resume_speed = None
+            self.motion_epoch += 1
+        aborted = [name for name, s in self.strategies.items()
+                   if hasattr(s, "abort") and s.abort(reason)]
+        if had_resume or aborted:
+            print(f"[SignController] Cancelled pending motion ({reason}): "
+                  f"resume={had_resume} aborted={sorted(set(aborted))}")
+
+    def on_obstacle_detected(self) -> None:
+        """The ESP32 blocked forward motion. Let maneuvers that need it give up."""
+        for name, s in self.strategies.items():
+            if hasattr(s, "on_obstacle_detected"):
+                s.on_obstacle_detected()
 
     def schedule_speed_resume(self, delay_seconds: float, override_speed: int = None) -> int:
         """
