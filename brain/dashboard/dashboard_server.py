@@ -565,6 +565,21 @@ def parse_system_events(line: str):
         if command_sender is not None:
             command_sender.reset_link_state()
             command_sender.send_arm()
+    elif line.startswith('EVENT:CMD_REJECTED:SET_SPEED:'):
+        # The ESP32 ignored a C:SET_SPEED > 0 (reported once per episode).
+        raw_reason = line.replace('EVENT:CMD_REJECTED:SET_SPEED:', '').split()
+        reason = raw_reason[0] if raw_reason else ''
+        if reason == 'OBSTACLE':
+            # Expected while blocked: keep last_speed, OBSTACLE_CLEARED re-sends it.
+            print("[UltraSafety] Forward speed held by the ESP32 (obstacle ahead)")
+        else:
+            # DISARMED / FAULT / SYS_STOP: the speed was never applied. Forget it,
+            # or a later OBSTACLE_CLEARED would start the car with it after re-arming.
+            print(f"[SystemState] ESP32 rejected SET_SPEED ({reason})", file=sys.stderr)
+            halt_jetson_motion(f"SET_SPEED rejected: {reason}")
+    elif line.startswith('EVENT:CMD_REJECTED:'):
+        # e.g. CMD_REJECTED:SYS_ARM:ESTOP_ACTIVE: the car stays where it was.
+        print(f"[SystemState] ESP32 {line.replace('EVENT:', '')}", file=sys.stderr)
     elif line.startswith('EVENT:WATCHDOG_TIMEOUT') or line.startswith('EVENT:ESTOP_TRIGGERED'):
         # FAULT is never cleared automatically: re-arm from the dashboard
         print(f"[SystemState] ESP32 fault: {line}", file=sys.stderr)

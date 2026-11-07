@@ -24,9 +24,11 @@ SERVO_MIN = 50
 SERVO_MAX = 160
 STEER_INVERTED = False
 
-# C:SET_SPEED is a PWM duty (0-255). Below DUTY_START the motor does not start
-# from standstill and the firmware ignores it in silence (measured 2026-08-04),
-# so any non-zero UI speed (1-255) is mapped onto DUTY_START..DUTY_MAX.
+# C:SET_SPEED is a PWM duty (0-255). The firmware's start threshold is 130
+# (bench, 2026-11-06): below it the motor hums but does not turn, and the
+# firmware still reports CMD_EXECUTED, so the failure is silent. DUTY_START
+# keeps a margin for the loaded car on the floor; any non-zero UI speed (1-255)
+# is mapped onto DUTY_START..DUTY_MAX.
 SPEED_UI_MAX = 255
 DUTY_START = 140
 DUTY_MAX = 255
