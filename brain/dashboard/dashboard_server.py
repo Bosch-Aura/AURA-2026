@@ -97,6 +97,27 @@ except ImportError:
     SERIAL_AVAILABLE = False
     print("Warning: pyserial not installed. Install with: pip install pyserial", file=sys.stderr)
 
+# pyserial's Linux enumerator only globs well-known names (ttyUSB*, ttyACM*, ...).
+# The Jetson's CH341 driver creates /dev/ttyCH341USB*, which comports() misses.
+EXTRA_SERIAL_GLOBS = ('/dev/ttyCH341USB*',)
+
+
+def list_serial_ports():
+    """comports() plus device names pyserial does not know about (e.g. ttyCH341USB*)."""
+    ports = list(serial_list_ports.comports())
+    known = {p.device for p in ports}
+    try:
+        import glob
+        from serial.tools.list_ports_linux import SysFS
+        for pattern in EXTRA_SERIAL_GLOBS:
+            for dev in sorted(glob.glob(pattern)):
+                if dev not in known:
+                    ports.append(SysFS(dev))
+                    known.add(dev)
+    except ImportError:
+        pass  # not Linux
+    return ports
+
 # Check CUDA availability
 CUDA_AVAILABLE = False
 CUDA_DEVICE_COUNT = 0
@@ -927,7 +948,7 @@ def list_ports():
         return jsonify({'error': 'pyserial not installed', 'ports': []}), 500
 
     try:
-        ports_list = list(serial_list_ports.comports())
+        ports_list = list_serial_ports()
         ports = []
         for p in ports_list:
             ports.append({
@@ -979,8 +1000,10 @@ def initialize_autopilot_if_needed():
         if video_streamer is None and VideoStreamer is not None:
             video_streamer = VideoStreamer()
             if not video_streamer.initialize():
+                # Don't keep a dead streamer: the next start must retry the camera
+                video_streamer = None
                 return False
-    
+
     # Initialize autopilot controller
     if video_streamer is not None:
         if MarcosLaneDetector_Advanced is None:
@@ -1756,7 +1779,7 @@ def select_port_interactive() -> str:
         print("Warning: pyserial not installed. Cannot select port.")
         return None
 
-    ports = list(serial_list_ports.comports())
+    ports = list_serial_ports()
     if not ports:
         print("No serial ports found. Connect the ESP32 (USB) and try again.")
         return None
