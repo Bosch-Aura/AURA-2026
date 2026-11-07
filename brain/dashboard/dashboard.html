@@ -38,6 +38,16 @@
           <div class="status-value" id="status-state">--</div>
         </div>
         <div class="status-item">
+          <span class="status-label">ESP32 Speed</span>
+          <div
+            class="status-value"
+            id="status-speed"
+            title="Duty latched on the ESP32. The speed is set once; this changes only when the ESP32 reports a change."
+          >
+            --
+          </div>
+        </div>
+        <div class="status-item">
           <span class="status-label">Updated</span>
           <div class="status-value" id="status-time">--</div>
         </div>
@@ -177,7 +187,8 @@
                 min="-255"
                 max="255"
                 value="0"
-                oninput="updateSpeed(this.value)"
+                oninput="previewSpeed(this.value)"
+                onchange="updateSpeed(this.value)"
               />
               <div class="value-display" id="speed-display">Stopped: 0</div>
             </div>
@@ -650,20 +661,54 @@
           if (message.startsWith("EVENT:STATE_CHANGED:")) {
             const state = message.replace("EVENT:STATE_CHANGED:", "").trim();
             updateStatusDisplay(state, null);
+            if (state === "DISARMED" || state === "FAULT") {
+              renderEsp32Speed({ duty: 0, held: null });
+            } else if (state === "RUNNING") {
+              renderEsp32Speed({ rejected: null });
+            }
+          } else if (message.startsWith("EVENT:SYSTEM_READY")) {
+            renderEsp32Speed({ duty: 0, held: null, rejected: null });
           } else if (message.startsWith("EVENT:CMD_EXECUTED:SET_SPEED:")) {
-            // ESP32 reports the applied PWM duty (0-255), not the UI speed:
-            // show it without moving the speed slider
+            // ESP32 reports the latched PWM duty (0-255), not the UI speed,
+            // and only when it changes: show it without moving the slider
             const duty = parseInt(
               message.replace("EVENT:CMD_EXECUTED:SET_SPEED:", "").trim()
             );
-            const speedDisplay = document.getElementById("speed-display");
-            if (!isNaN(duty) && speedDisplay) {
-              speedDisplay.textContent =
-                duty === 0 ? "Stopped: 0" : `Duty: ${duty}`;
+            if (!isNaN(duty)) {
+              renderEsp32Speed({ duty: duty, rejected: null });
+              log(`ESP32 speed latched: duty ${duty}`, "info");
             }
+          } else if (message.startsWith("EVENT:CMD_EXECUTED:BRAKE_NOW")) {
+            renderEsp32Speed({ duty: 0 });
+          } else if (message.startsWith("EVENT:CMD_REJECTED:SET_SPEED:")) {
+            const reason = message
+              .replace("EVENT:CMD_REJECTED:SET_SPEED:", "")
+              .trim();
+            renderEsp32Speed({ duty: 0, rejected: reason });
+            log(`ESP32 ignored the speed (${reason}) - arm / resume and send it again`, "error");
+          } else if (message.startsWith("EVENT:OBSTACLE_HOLD:")) {
+            const held = parseInt(
+              message.replace("EVENT:OBSTACLE_HOLD:", "").trim()
+            );
+            if (!isNaN(held)) {
+              renderEsp32Speed({ duty: 0, held: held > 0 ? held : null });
+              log(
+                held > 0
+                  ? `Obstacle hold - ESP32 keeps duty ${held} and resumes by itself`
+                  : "Obstacle hold - no speed kept, the car will not resume by itself",
+                "error"
+              );
+            }
+          } else if (message.startsWith("EVENT:OBSTACLE_RESUMED:")) {
+            const duty = parseInt(
+              message.replace("EVENT:OBSTACLE_RESUMED:", "").trim()
+            );
+            if (!isNaN(duty)) renderEsp32Speed({ duty: duty, held: null });
+            log(`Path clear - ESP32 resumed at duty ${duty}`, "success");
           } else if (message.startsWith("EVENT:OBSTACLE_DETECTED")) {
             log(`Obstacle ahead - ESP32 blocked forward motion, reverse still works (${message})`, "error");
           } else if (message.startsWith("EVENT:OBSTACLE_CLEARED")) {
+            renderEsp32Speed({ held: null });
             log("Obstacle cleared", "success");
           } else if (message.startsWith("EVENT:ULTRASONIC_SILENT")) {
             log("Ultrasonic: no valid readings for 2 s (open space, or sensor fault if something is ahead)", "info");
@@ -728,6 +773,7 @@
               statusData.state || null,
               statusData.mode || null
             );
+            if (statusData.esp32_speed) renderEsp32Speed(statusData.esp32_speed);
             return;
           }
         } catch (error) {
@@ -870,6 +916,7 @@
               statusData.state || null,
               statusData.mode || null
             );
+            if (statusData.esp32_speed) renderEsp32Speed(statusData.esp32_speed);
           }
         } catch (error) {
           // Silently fail - status update is not critical
@@ -1015,6 +1062,46 @@
         }
       }
 
+      // Speed the ESP32 has latched, as reported by its events. The brain sets
+      // the speed once; this is only redrawn when the ESP32 reports a change.
+      const esp32Speed = { duty: null, held: null, rejected: null };
+
+      function renderEsp32Speed(changes) {
+        Object.assign(esp32Speed, changes);
+        const el = document.getElementById("status-speed");
+        if (!el) return;
+        let text = "--";
+        if (esp32Speed.rejected) {
+          text = `Rejected (${esp32Speed.rejected})`;
+        } else if (esp32Speed.held !== null) {
+          text = `Held ${esp32Speed.held} (obstacle)`;
+        } else if (esp32Speed.duty === 0) {
+          text = "Stopped";
+        } else if (esp32Speed.duty !== null) {
+          text = `Duty ${esp32Speed.duty}`;
+        }
+        if (el.textContent !== text) {
+          el.textContent = text;
+          document.getElementById("status-time").textContent =
+            new Date().toLocaleTimeString();
+        }
+      }
+
+      function speedLabel(signedSpeed) {
+        if (signedSpeed === 0) return "Stopped: 0";
+        if (signedSpeed > 0) return `Forward: ${signedSpeed}`;
+        return `Backward: ${signedSpeed}`;
+      }
+
+      function previewSpeed(value) {
+        // While dragging: only the label. The command goes once, on release.
+        const signedSpeed = parseInt(value);
+        const speedValue = document.getElementById("speed-value");
+        const speedDisplay = document.getElementById("speed-display");
+        if (speedValue) speedValue.textContent = signedSpeed;
+        if (speedDisplay) speedDisplay.textContent = speedLabel(signedSpeed);
+      }
+
       function updateSpeed(value) {
         // Update UI immediately for user feedback
         const signedSpeed = parseInt(value);
@@ -1024,15 +1111,7 @@
         const speedDisplay = document.getElementById("speed-display");
 
         if (speedValue) speedValue.textContent = signedSpeed;
-        if (speedDisplay) {
-          if (signedSpeed === 0) {
-            speedDisplay.textContent = "Stopped: 0";
-          } else if (signedSpeed > 0) {
-            speedDisplay.textContent = `Forward: ${signedSpeed}`;
-          } else {
-            speedDisplay.textContent = `Backward: ${signedSpeed}`;
-          }
-        }
+        if (speedDisplay) speedDisplay.textContent = speedLabel(signedSpeed);
 
         // Send command to ESP32 via backend translator
         if (speedMagnitude === 0) {
