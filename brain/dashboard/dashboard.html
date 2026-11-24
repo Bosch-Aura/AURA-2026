@@ -129,7 +129,7 @@
           <div class="section">
             <h2 class="section-title">Motor</h2>
             <div class="button-grid">
-              <button class="btn btn-success" onclick="sendCommand('forward')">
+              <button class="btn btn-success" onclick="driveForward()">
                 FWD
               </button>
               <button class="btn btn-danger" onclick="sendCommand('back')">
@@ -198,7 +198,10 @@
                 min="-255"
                 max="255"
                 value="0"
-                oninput="updateSpeed(this.value)"
+                oninput="previewSpeed(this.value)"
+                onchange="updateSpeed(this.value)"
+                onpointerdown="speedSliderDragging = true"
+                onpointerup="speedSliderDragging = false"
               />
               <div class="value-display" id="speed-display">Stopped: 0</div>
             </div>
@@ -569,19 +572,19 @@
               "
             >
               <div class="video-container">
-                <img src="/debug/bird_view_lines" alt="Bird View" />
+                <img data-debug-view="bird_view_lines" alt="Bird View" />
                 <div class="video-label">Bird View</div>
               </div>
               <div class="video-container">
-                <img src="/debug/sliding_windows" alt="Sliding Windows" />
+                <img data-debug-view="sliding_windows" alt="Sliding Windows" />
                 <div class="video-label">Sliding Windows</div>
               </div>
               <div class="video-container">
-                <img src="/debug/final_result" alt="Final Result" />
+                <img data-debug-view="final_result" alt="Final Result" />
                 <div class="video-label">Final Result</div>
               </div>
               <div class="video-container">
-                <img src="/debug/sign_detections" alt="Sign Detections" />
+                <img data-debug-view="sign_detections" alt="Sign Detections" />
                 <div class="video-label">Sign Detections</div>
               </div>
             </div>
@@ -703,7 +706,7 @@
               const speedValue = document.getElementById("speed-value");
               const speedDisplay = document.getElementById("speed-display");
 
-              if (speedSlider && speedValue && speedDisplay) {
+              if (speedSlider && speedValue && speedDisplay && !speedSliderDragging) {
                 speedSlider.value = speed;
                 speedValue.textContent = speed;
                 speedDisplay.textContent =
@@ -1108,9 +1111,36 @@
         }
       }
 
+      // Speed the user chose with the slider / preset buttons. FWD drives at this
+      // speed (it used to always send 220). ESP32 echoes (e.g. 0 after STOP) only
+      // move the slider, they don't change this value.
+      const DEFAULT_FORWARD_SPEED = 220;
+      let selectedSpeed = DEFAULT_FORWARD_SPEED;
+      let speedSliderDragging = false;
+
+      function driveForward() {
+        updateSpeed(selectedSpeed);
+      }
+
+      function previewSpeed(value) {
+        // While dragging: update the display only, nothing is sent to the car.
+        const signedSpeed = parseInt(value);
+        const speedValue = document.getElementById("speed-value");
+        const speedDisplay = document.getElementById("speed-display");
+        if (speedValue) speedValue.textContent = signedSpeed;
+        if (speedDisplay) {
+          speedDisplay.textContent =
+            signedSpeed === 0 ? "Stopped: 0" : `Release to set: ${signedSpeed}`;
+        }
+      }
+
       function updateSpeed(value) {
+        speedSliderDragging = false;
         // Update UI immediately for user feedback
         const signedSpeed = parseInt(value);
+        if (signedSpeed > 0) selectedSpeed = signedSpeed;
+        const speedSlider = document.getElementById("speed-slider");
+        if (speedSlider) speedSlider.value = signedSpeed;
         const speedMagnitude = Math.abs(signedSpeed);
         const direction = signedSpeed < 0 ? "backward" : "forward";
         const speedValue = document.getElementById("speed-value");
@@ -1864,6 +1894,25 @@
       // Initialize - refresh ports on load (connection status will be checked after ports load)
       log("Dashboard initialized. Select UART port and click Connect.", "info");
       refreshPorts();
+    
+      // Debug views: poll single JPEG snapshots, one request at a time, instead of
+      // 4 MJPEG streams. Streams kept 4 of the browser's 6 connections per host busy
+      // (plus /events and /uart/stream), so START/STOP requests never got sent.
+      (function startDebugSnapshots() {
+        const imgs = Array.from(document.querySelectorAll("img[data-debug-view]"));
+        if (imgs.length === 0) return;
+        let i = 0;
+        function next() {
+          const img = imgs[i];
+          i = (i + 1) % imgs.length;
+          const loader = new Image();
+          const done = () => setTimeout(next, 50);
+          loader.onload = () => { img.src = loader.src; done(); };
+          loader.onerror = () => setTimeout(next, 1000);
+          loader.src = `${getBaseURL()}/debug/snapshot/${img.dataset.debugView}?t=${Date.now()}`;
+        }
+        next();
+      })();
     </script>
   </body>
 </html>

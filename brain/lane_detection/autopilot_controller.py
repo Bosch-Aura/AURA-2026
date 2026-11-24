@@ -280,7 +280,9 @@ class AutoPilotController:
                     if not self.is_running:
                         break
                 
-                # Convert steering angle to servo angle
+                # Convert steering angle to servo angle.
+                # inverted=True is correct: left curve -> negative deviation -> positive
+                # PID output -> inverted -> servo > 105 = LEFT (160 = left on this car).
                 servo_angle = self.angle_converter.convert(steering_angle, inverted=True)
                 #print(f"Angle Converter: Servo angle: {servo_angle}")
                 

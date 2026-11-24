@@ -79,6 +79,9 @@ class MarcosLaneDetector_Advanced(LaneDetector):
         self.CLUSTER_MATCH_Y_SAMPLES = np.array([480, 420, 360, 300], dtype=np.float32)
         self.CLUSTER_MATCH_MAX_COST = 180.0
         self.CLUSTER_SWAP_PENALTY = 40.0
+        # Mono (una sola línea): si la base está a más de este margen del centro,
+        # el lado lo define la posición, no la memoria temporal.
+        self.MONO_SIDE_MARGIN_PX = 40.0
         self.CLUSTER_CENTER_DEADBAND_PX = 15.0
 
         # --- Máscaras separadas para detectar vs clasificar tipo de línea ---
@@ -862,6 +865,19 @@ class MarcosLaneDetector_Advanced(LaneDetector):
         # --- NIVEL 2/3: MONO SIMÉTRICO (sin prioridad fija por lado) ---
         if detection_mode == "NONE":
             mono_candidates = []
+
+            # Con UNA sola línea, el lado lo decide la posición de su base (y=480, la
+            # parte más cercana al auto), no la memoria temporal: si la memoria quedó
+            # mal (izquierda etiquetada como derecha) se auto-refuerza cuadro a cuadro
+            # y el auto dobla para el lado equivocado ("ve la línea izquierda y dice
+            # MONO_RIGHT"). En el margen central se mantiene la lógica temporal.
+            if (left_fit_current is None) != (right_fit_current is None):
+                single_fit = left_fit_current if left_fit_current is not None else right_fit_current
+                base_x = single_fit[0] * 480**2 + single_fit[1] * 480 + single_fit[2]
+                if base_x < MIDPOINT_X - self.MONO_SIDE_MARGIN_PX:
+                    left_fit_current, right_fit_current = single_fit, None
+                elif base_x > MIDPOINT_X + self.MONO_SIDE_MARGIN_PX:
+                    left_fit_current, right_fit_current = None, single_fit
 
             def _fit_temporal_distance(candidate_fit, prev_fit):
                 if candidate_fit is None:

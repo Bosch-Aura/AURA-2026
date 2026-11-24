@@ -121,6 +121,19 @@ class SignDetector:
                 return False
             
             print(f"[SignDetector] Model loaded successfully")
+
+            # Warm-up: the TensorRT engine is really loaded on the FIRST inference, which
+            # freezes the whole Python process for seconds. Do it here (during init, while
+            # the dashboard keeps the ESP32 in MANUAL) instead of in the detection loop,
+            # where the frozen heartbeat made the ESP32 watchdog go to FAULT.
+            try:
+                import numpy as np
+                t0 = time.time()
+                self.model(np.zeros((480, 640, 3), dtype=np.uint8), verbose=False, device=self.device)
+                print(f"[SignDetector] Warm-up inference done in {time.time() - t0:.1f}s")
+            except Exception as e:
+                print(f"[SignDetector] Warm-up inference failed (non fatal): {e}")
+
             print(f"[SignDetector] Confidence threshold: {self.confidence_threshold}")
             return True
             

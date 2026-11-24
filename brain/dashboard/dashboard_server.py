@@ -51,6 +51,12 @@ except Exception as e:
 
 try:
     from command_sender import CommandSender
+    from command_sender import (
+        set_protocol as set_uart_protocol,
+        get_protocol as get_uart_protocol,
+        PROTOCOL_ESP32,
+        SUPPORTED_PROTOCOLS,
+    )
 except ImportError as e:
     print(f"Warning: Could not import CommandSender: {e}")
     CommandSender = None
@@ -194,15 +200,21 @@ CORS(app)  # Enable CORS for all routes
 
 
 def write_uart_command(command: str):
-    """Write a UART command. Nucleo expects lines ending with \\r\\n (do not strip)."""
+    """Write a UART command, with the line terminator the active protocol expects.
+
+    - nucleo: keep ';;\\r\\n' intact (do not strip or the Nucleo may not parse).
+    - esp32: terminate with a single '\\n'. The ESP32 splits lines on '\\r' OR '\\n',
+      so '\\r\\n' would make it receive an extra empty line and log a parse error.
+    """
     global serial_conn
     if not serial_conn or not serial_conn.is_open:
         return False, "Serial port not connected"
 
     try:
         with serial_lock:
-            # Keep terminator ;;\\r\\n intact - do not strip or Nucleo may not parse
-            if not command.endswith("\n"):
+            if get_uart_protocol() == PROTOCOL_ESP32:
+                command = command.rstrip("\r\n") + "\n"
+            elif not command.endswith("\n"):
                 command = command + "\r\n"
             line = command.encode("utf-8")
             serial_conn.write(line)
@@ -214,55 +226,38 @@ def write_uart_command(command: str):
 
 
 def translate_http_to_uart(endpoint: str, args: dict):
-    """Translate HTTP endpoint to UART command (Nucleo: #key:payload;;\\r\\n, keys from main.cpp)."""
-    from command_sender import KEY_STEER, KEY_SPEED, KEY_BRAKE, KEY_KL
-    SERVO_CENTER = 105
-    SERVO_RIGHT = 50   # Right turn (lower value)
-    SERVO_LEFT = 160   # Left turn (higher value)
-    ANGLE_MAX = 30
-    SPEED_UI_MAX = 255
-    SPEED_MM_S_MAX = 500
-    STEER_TENTHS_MIN = -250
-    STEER_TENTHS_MAX = 250
+    """Translate HTTP endpoint to a UART command for the active protocol (see command_sender)."""
+    from command_sender import (
+        SERVO_CENTER, SERVO_RIGHT, SERVO_LEFT, SPEED_UI_MAX,
+        build_arm, build_disarm, build_mode, build_brake,
+        build_speed, build_steer, build_lights,
+    )
     FORWARD_SPEED = 220
+    no_reverse_msg = "Backward not supported by the ESP32 firmware (no reverse)"
 
-    def format_command(key: str, payload: str) -> str:
-        return f"#{key}:{payload}{UART_TERMINATOR}"
-
-    def convert_ui_speed_to_mm_s(speed_value: int, direction: str = "forward") -> int:
-        scaled = int(round((speed_value / SPEED_UI_MAX) * SPEED_MM_S_MAX))
-        scaled = -abs(scaled) if direction.lower() == "backward" else abs(scaled)
-        return max(-SPEED_MM_S_MAX, min(SPEED_MM_S_MAX, scaled))
-
-    def convert_servo_to_steer_tenths(angle_value: int) -> int:
-        conversion_factor = (SERVO_CENTER - SERVO_RIGHT) / ANGLE_MAX
-        steering_angle = (SERVO_CENTER - angle_value) / conversion_factor
-        steering_tenths = int(round(steering_angle * 10))
-        return max(STEER_TENTHS_MIN, min(STEER_TENTHS_MAX, steering_tenths))
-
-    # kl = Nucleo CKlmanager (arm/disarm/mode)
     if endpoint == 'arm':
-        return True, "ARM", format_command(KEY_KL, "30")
+        return True, "ARM", build_arm()
     elif endpoint == 'disarm':
-        return True, "DISARM", format_command(KEY_KL, "0")
+        return True, "DISARM", build_disarm()
     elif endpoint == 'mode':
         value = args.get('value', '').upper()
         if value == 'AUTO':
-            return True, "MODE: AUTO", format_command(KEY_KL, "30")
+            return True, "MODE: AUTO", build_mode(True)
         elif value == 'MANUAL':
-            return True, "MODE: MANUAL", format_command(KEY_KL, "15")
+            return True, "MODE: MANUAL", build_mode(False)
         else:
             return False, "Invalid mode value", None
     elif endpoint == 'brake':
-        return True, "BRAKE", format_command(KEY_BRAKE, "0")
+        return True, "BRAKE", build_brake()
     elif endpoint == 'forward':
-        speed_mm_s = convert_ui_speed_to_mm_s(FORWARD_SPEED, "forward")
-        return True, "FORWARD", format_command(KEY_SPEED, str(speed_mm_s))
+        return True, "FORWARD", build_speed(FORWARD_SPEED, "forward")
     elif endpoint == 'back':
-        speed_mm_s = convert_ui_speed_to_mm_s(SPEED_UI_MAX, "backward")
-        return True, "BACKWARD", format_command(KEY_SPEED, str(speed_mm_s))
+        cmd = build_speed(SPEED_UI_MAX, "backward")
+        if cmd is None:
+            return False, no_reverse_msg, None
+        return True, "BACKWARD", cmd
     elif endpoint == 'driveStop':
-        return True, "STOP", format_command(KEY_SPEED, "0")
+        return True, "STOP", build_speed(0)
     elif endpoint == 'changeSpeed':
         speed_str = args.get('speed', '0')
         direction_str = args.get('direction', 'forward')
@@ -271,41 +266,34 @@ def translate_http_to_uart(endpoint: str, args: dict):
             if speed < 0 or speed > SPEED_UI_MAX:
                 return False, f"Speed must be 0-{SPEED_UI_MAX}", None
             if speed == 0:
-                return True, "STOP", format_command(KEY_SPEED, "0")
-            else:
-                speed_mm_s = convert_ui_speed_to_mm_s(speed, direction_str)
-                return (
-                    True,
-                    f"SPEED: {speed} ({direction_str})",
-                    format_command(KEY_SPEED, str(speed_mm_s)),
-                )
+                return True, "STOP", build_speed(0)
+            cmd = build_speed(speed, direction_str)
+            if cmd is None:
+                return False, no_reverse_msg, None
+            return True, f"SPEED: {speed} ({direction_str})", cmd
         except ValueError:
             return False, "Invalid speed value", None
     elif endpoint == 'steer' or endpoint == 'changeSteer':
-        angle_str = args.get('angle', '105')
+        angle_str = args.get('angle', str(SERVO_CENTER))
         try:
             angle = int(angle_str)
             if angle < SERVO_RIGHT or angle > SERVO_LEFT:
                 return False, f"Angle must be {SERVO_RIGHT}-{SERVO_LEFT}", None
-            steering_tenths = convert_servo_to_steer_tenths(angle)
-            return True, f"STEER: {angle}°", format_command(KEY_STEER, str(steering_tenths))
+            return True, f"STEER: {angle}°", build_steer(angle)
         except ValueError:
             return False, "Invalid angle value", None
     elif endpoint == 'left':
-        steering_tenths = convert_servo_to_steer_tenths(SERVO_LEFT)
-        return True, "LEFT", format_command(KEY_STEER, str(steering_tenths))
+        return True, "LEFT", build_steer(SERVO_LEFT)
     elif endpoint == 'right':
-        steering_tenths = convert_servo_to_steer_tenths(SERVO_RIGHT)
-        return True, "RIGHT", format_command(KEY_STEER, str(steering_tenths))
+        return True, "RIGHT", build_steer(SERVO_RIGHT)
     elif endpoint == 'steerStop':
-        steering_tenths = convert_servo_to_steer_tenths(SERVO_CENTER)
-        return True, "CENTER", format_command(KEY_STEER, str(steering_tenths))
-    elif endpoint == 'LightsOn':
-        return False, "Lights not supported", None
-    elif endpoint == 'LightsOff':
-        return False, "Lights not supported", None
-    elif endpoint == 'LightsAuto':
-        return False, "Lights not supported", None
+        return True, "CENTER", build_steer(SERVO_CENTER)
+    elif endpoint in ('LightsOn', 'LightsOff', 'LightsAuto'):
+        state = endpoint[len('Lights'):]
+        cmd = build_lights(state)
+        if cmd is None:
+            return False, "Lights not supported", None
+        return True, f"LIGHTS {state.upper()}", cmd
     else:
         return False, f"Unknown endpoint: {endpoint}", None
 
@@ -391,18 +379,23 @@ def open_serial(port: str, baud: int = UART_BAUD_RATE):
     if not SERIAL_AVAILABLE:
         raise RuntimeError("pyserial not installed")
 
-    ser = serial.Serial(
-        port=port,
-        baudrate=baud,
-        timeout=0.1,  # Shorter timeout for more responsive reading
-        write_timeout=1.0,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        xonxoff=False,
-        rtscts=False,
-        dsrdtr=False
-    )
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = baud
+    ser.timeout = 0.1  # Shorter timeout for more responsive reading
+    ser.write_timeout = 1.0
+    ser.bytesize = serial.EIGHTBITS
+    ser.parity = serial.PARITY_NONE
+    ser.stopbits = serial.STOPBITS_ONE
+    ser.xonxoff = False
+    ser.rtscts = False
+    ser.dsrdtr = False
+    # Keep DTR/RTS low BEFORE opening: on the ESP32 DevKit (CH340 auto-reset
+    # circuit) asserting them on open resets the board (~10 s boot delay) or
+    # holds it in reset. Harmless for the Nucleo ST-Link.
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
     ser.reset_input_buffer()
     ser.reset_output_buffer()
     return ser
@@ -623,7 +616,7 @@ def stop_serial_reader():
 
 
 def heartbeat_worker():
-    """Send #alive to Nucleo so watchdog does not stop the motors (every 50ms when UART connected)."""
+    """Send heartbeat (#alive / M:HEARTBEAT) every 50ms so the controller watchdog (~120ms) does not stop the motors."""
     global serial_conn, heartbeat_sender_running, command_sender
 
     while heartbeat_sender_running:
@@ -632,14 +625,19 @@ def heartbeat_worker():
                 command_sender.send_heartbeat()
             except Exception as e:
                 print(f"[Heartbeat] Error: {e}", file=sys.stderr)
-        time.sleep(0.05)  # 50ms; Nucleo watchdog typically ~120ms
+        time.sleep(0.05)  # 50ms; watchdog is 120ms on both ESP32 and Nucleo
 
     print("[Heartbeat] Worker thread stopped")
 
 
 def start_heartbeat_sender():
     """Start the heartbeat sender thread."""
-    global heartbeat_sender_thread, heartbeat_sender_running
+    global heartbeat_sender_thread, heartbeat_sender_running, command_sender
+
+    # When connecting from the CLI (--port-name / --auto-connect) nothing else
+    # creates the CommandSender, and without it no heartbeat is ever sent.
+    if command_sender is None and CommandSender is not None:
+        command_sender = CommandSender(write_uart_command)
 
     if heartbeat_sender_thread is None or not heartbeat_sender_thread.is_alive():
         heartbeat_sender_running = True
@@ -975,11 +973,52 @@ def list_ports():
                 'description': p.description or 'No description',
                 'hwid': getattr(p, 'hwid', 'Unknown')
             })
+        # The WCH vendor CH341 driver registers /dev/ttyCH341USB* outside the
+        # usb-serial bus, so pyserial never lists it. Add those nodes by name.
+        import glob
+        known = {p['device'] for p in ports}
+        for dev in sorted(glob.glob('/dev/ttyCH341USB*')):
+            if dev not in known:
+                ports.append({
+                    'device': dev,
+                    'description': 'CH340/CH341 (WCH vendor driver) - ESP32',
+                    'hwid': 'USB VID:PID=1A86:7523'
+                })
         return jsonify({'ports': ports, 'count': len(ports)}), 200
     except Exception as e:
         return jsonify({'error': str(e), 'ports': []}), 500
 
 
+def _watchdog_safe_init(is_initialized):
+    """Run a blocking controller initialization without tripping the ESP32 watchdog.
+
+    Initializing the RealSense camera (autopilot) or loading the TensorRT model (sign
+    detection) freezes Python for several hundred ms, so the heartbeat thread cannot
+    send and the ESP32 watchdog (only active in AUTO) goes to FAULT. If the ESP32 is in
+    AUTO: stop the car, switch to MANUAL while initializing, and restore AUTO after.
+    """
+    import functools
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            from command_sender import build_mode, build_speed
+            if is_initialized() or system_state.get('mode') != 'AUTO' \
+                    or not (serial_conn and serial_conn.is_open):
+                return fn(*args, **kwargs)
+            print(f"[Dashboard] {fn.__name__}: AUTO -> MANUAL during init (avoid watchdog FAULT)")
+            write_uart_command(build_speed(0))
+            write_uart_command(build_mode(False))
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                write_uart_command(build_mode(True))
+                print(f"[Dashboard] {fn.__name__}: init done, back to AUTO")
+        return wrapper
+    return decorator
+
+
+@_watchdog_safe_init(lambda: autopilot_controller is not None)
 def initialize_autopilot_if_needed():
     """Initialize autopilot controller if conditions are met."""
     global autopilot_controller, command_sender, video_streamer, serial_conn
@@ -1074,6 +1113,7 @@ def on_sign_controller_event(event_type, data):
                     pass
 
 
+@_watchdog_safe_init(lambda: sign_detection_controller is not None)
 def initialize_sign_detection_if_needed():
     """Initialize sign detection controller if conditions are met."""
     global sign_detection_controller, sign_detector, video_streamer, serial_conn, command_sender, autopilot_controller
@@ -1153,6 +1193,17 @@ def uart_connect():
 
     if not port:
         return jsonify({'error': 'Port not specified'}), 400
+
+    # Already connected to this port: do nothing. Reopening the port resets the
+    # ESP32 (the WCH CH340 driver toggles DTR/RTS anyway), which takes ~10 s and
+    # drops it back to MANUAL/ARMED, losing AUTO mode and the commands sent meanwhile.
+    if serial_conn and serial_conn.is_open and serial_conn.port == port:
+        return jsonify({
+            'status': 'ok',
+            'message': f'Already connected to {port}',
+            'port': port,
+            'baudrate': UART_BAUD_RATE,
+        })
 
     try:
         if serial_conn and serial_conn.is_open:
@@ -1400,6 +1451,36 @@ def generate_debug_mjpeg(image_key=None, mode='autopilot',
                        b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
         
         time.sleep(0.033)  # ~30 FPS
+
+
+DEBUG_SNAPSHOT_SOURCES = {
+    'bird_view_lines': dict(mode='autopilot', image_key='bird_view_lines', waiting_text='Waiting for lane detection...', not_running_text='Lane detection not running'),
+    'sliding_windows': dict(mode='autopilot', image_key='sliding_windows', waiting_text='Waiting for lane detection...', not_running_text='Lane detection not running'),
+    'final_result': dict(mode='autopilot', image_key='final_result', waiting_text='Waiting for lane detection...', not_running_text='Lane detection not running'),
+    'sign_detections': dict(mode='sign_detector', waiting_text='Waiting for sign detection...', not_running_text='Sign detection not running'),
+}
+
+
+@app.route('/debug/snapshot/<name>')
+def debug_snapshot(name):
+    """Single JPEG frame of a debug view.
+
+    The dashboard polls these instead of keeping 4 MJPEG streams open: browsers allow
+    only 6 HTTP/1.1 connections per host, and 4 streams + /events + /uart/stream used
+    them all, so START/STOP requests stayed queued in the browser forever.
+    """
+    source = DEBUG_SNAPSHOT_SOURCES.get(name)
+    if source is None:
+        return jsonify({'error': f'Unknown debug view: {name}'}), 404
+    gen = generate_debug_mjpeg(**source)
+    try:
+        chunk = next(gen)
+    finally:
+        gen.close()
+    jpeg = chunk.split(b'\r\n\r\n', 1)[1].rstrip(b'\r\n')
+    resp = Response(jpeg, mimetype='image/jpeg')
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 @app.route('/debug/bird_view_lines')
@@ -1811,7 +1892,14 @@ def select_port_interactive() -> str:
 
     ports = list(serial_list_ports.comports())
     if not ports:
-        print("No serial ports found. Connect the Nucleo (ST-Link USB) and try again.")
+        # The WCH vendor CH341 driver registers /dev/ttyCH341USB* outside the
+        # usb-serial bus, so pyserial does not list it. Look for it by name.
+        import glob
+        extra = sorted(glob.glob('/dev/ttyCH341USB*'))
+        if extra:
+            print(f"pyserial found no ports; using CH341 device: {extra[0]}")
+            return extra[0]
+        print("No serial ports found. Connect the ESP32 / Nucleo and try again.")
         return None
     if len(ports) == 1:
         selected = ports[0].device
@@ -1848,12 +1936,15 @@ def _main():
     parser.add_argument('--auto-connect', dest='auto_connect', action='store_true', help='Interactively select serial port on startup')
     parser.add_argument('--lane-detection', dest='lane_detection', action='store_true', help='Start lane detection (autopilot) when UART connected')
     parser.add_argument('--sign-detection', dest='sign_detection', action='store_true', help='Start sign detection when UART connected')
+    parser.add_argument('--protocol', choices=SUPPORTED_PROTOCOLS, default=get_uart_protocol(),
+                        help='Low-level controller UART protocol (default: %(default)s, or env AURA_UART_PROTOCOL)')
 
     args = parser.parse_args()
+    set_uart_protocol(args.protocol)
     local_ip = get_local_ip()
 
     print("=" * 70)
-    print(" " * 15 + "Car Control Dashboard (Nucleo/STM32)")
+    print(" " * 15 + f"Car Control Dashboard (UART protocol: {get_uart_protocol()})")
     print("=" * 70)
     print()
 
